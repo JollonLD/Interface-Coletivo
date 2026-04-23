@@ -55,9 +55,9 @@ class MockDataReceiver(BaseDataReceiver):
         self.force_max_kg = 4.0
         self.force_rate_deadband_pct_s = 0.05
         self._maneuver_catalog = [
-            "Circuito Classico",
-            "Subida Rapida e Arremetida",
-            "Autorrotacao Treino",
+            "Circuito",
+            "Subida Rapida",
+            "Treino",
         ]
 
     def _ramp(self, current: float, target: float, start: float, end: float) -> float:

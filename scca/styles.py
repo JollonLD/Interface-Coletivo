@@ -79,8 +79,8 @@ QLabel#stateLabel {
     font-weight: 600;
     padding: 6px 10px;
     border-radius: 8px;
-    border: 1px solid #2b3a4c;
-    background-color: #13202d;
+    border: 1px solid #324255;
+    background-color: #1d2a38;
 }
 
 QLabel[state="ok"] {
@@ -97,8 +97,8 @@ QLabel[state="warn"] {
 
 QLabel[state="off"] {
     color: #8ea0b1;
-    border-color: #3d4b5b;
-    background-color: #1a2533;
+    border-color: #3b4b5d;
+    background-color: transparent;
 }
 
 QLabel#criticalAlert {
@@ -137,27 +137,27 @@ QPushButton#matrixTile {
 }
 
 QPushButton#matrixTile[tileKind="maneuver"][runState="idle"] {
-    color: #ffd9aa;
-    border: 2px solid #c5751f;
-    background-color: #4f2e0f;
+    color: #d8e3ef;
+    border: 2px solid #5a6f87;
+    background-color: #273749;
 }
 
 QPushButton#matrixTile[tileKind="maneuver"][runState="active"] {
-    color: #f1fff7;
+    color: #eafff2;
     border: 2px solid #16ff9a;
-    background-color: #4f2e0f;
+    background-color: #1d6548;
 }
 
 QPushButton#matrixTile[tileKind="pane"][runState="idle"] {
-    color: #ffd7d9;
-    border: 2px solid #a9353f;
-    background-color: #5b171e;
+    color: #d8e3ef;
+    border: 2px solid #5a6f87;
+    background-color: #273749;
 }
 
 QPushButton#matrixTile[tileKind="pane"][runState="active"] {
     color: #fff2f3;
     border: 2px solid #ff6e78;
-    background-color: #7a1c25;
+    background-color: #8c1f2a;
 }
 
 QPushButton#matrixTile:hover {

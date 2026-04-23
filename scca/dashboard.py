@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
+import time
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -19,8 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from scca.data_worker import DataWorkerThread, MockDataReceiver
 from scca.styles import DASHBOARD_QSS
+from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot
 
 
 class ToggleSliderButton(QAbstractButton):
@@ -156,8 +160,35 @@ class SccaDashboard(QMainWindow):
         self.setWindowTitle("Dashboard do Sistema de Comando Coletivo")
         self.resize(1300, 760)
 
-        self.receiver = MockDataReceiver()
-        self.worker = DataWorkerThread(self.receiver, interval_ms=100)
+        # Inicializar UDP Receiver (recebe telemetria do Raspberry Pi)
+        self.udp_receiver = UDPReceiver(host="0.0.0.0", port=12345)
+        self.udp_receiver.packet_received.connect(self._on_udp_packet_received)
+        self.udp_receiver.error_occurred.connect(self._on_udp_error)
+        self.udp_receiver.connection_status_changed.connect(self._on_udp_connection_changed)
+
+        # Inicializar Command Sender (envia manobras para Raspberry Pi)
+        initial_host = os.getenv("SCCA_COMMAND_HOST", "127.0.0.1")
+        try:
+            initial_port = int(os.getenv("SCCA_COMMAND_PORT", "12346"))
+        except ValueError:
+            initial_port = 12346
+            self.logger = logging.getLogger("Dashboard")
+            self.logger.warning("SCCA_COMMAND_PORT inválida; usando 12346")
+        self.command_sender = CommandSender(receiver_host=initial_host, receiver_port=initial_port)
+        self.command_sender.command_sent.connect(self._on_command_sent)
+        self.command_sender.error_occurred.connect(self._on_command_error)
+        self._command_target_host = initial_host
+        self._command_target_port = initial_port
+
+        # Simulador local opcional de Raspberry (comando + telemetria)
+        self.mock_raspberry = MockRaspberryAutopilot(
+            command_host="127.0.0.1",
+            command_port=initial_port,
+            telemetry_host="127.0.0.1",
+            telemetry_port=12345,
+        )
+        self.mock_raspberry.status_changed.connect(self._on_mock_status_changed)
+        self.mock_raspberry.error_occurred.connect(self._on_mock_error)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -179,7 +210,7 @@ class SccaDashboard(QMainWindow):
         states_panel = self._build_states_panel()
         telemetry_panel = self._build_telemetry_panel()
         maneuver_panel = self._build_maneuver_panel()
-        tests_panel = self._build_tests_panel(states_panel)
+        udp_panel = self._build_udp_panel()
 
         center_container = QWidget()
         center_layout = QVBoxLayout(center_container)
@@ -187,18 +218,23 @@ class SccaDashboard(QMainWindow):
         center_layout.setSpacing(12)
         center_layout.addWidget(telemetry_panel, 1)
         center_layout.addWidget(maneuver_panel)
+        center_layout.addWidget(udp_panel)
 
         body.addWidget(position_panel)
         body.addWidget(center_container, 1)
-        body.addWidget(tests_panel)
+        body.addWidget(states_panel)
 
         self.flash_timer = QTimer(self)
         self.flash_timer.setInterval(300)
         self.flash_timer.timeout.connect(self._toggle_alert_flash)
         self._flash_on = False
+        self._last_udp_packet_time = 0.0
+        
+        # Logger
+        self.logger = logging.getLogger("Dashboard")
 
-        self.worker.packet_received.connect(self.update_dashboard)
-        self.worker.start()
+        # Iniciar servidor UDP
+        self.udp_receiver.start()
 
     def _panel_frame(self) -> QFrame:
         frame = QFrame()
@@ -305,33 +341,33 @@ class SccaDashboard(QMainWindow):
         layout.addLayout(conn_row)
         return panel
 
-    def _build_tests_panel(self, states_panel: QFrame) -> QFrame:
-        panel = self._panel_frame()
-        panel.setProperty("sidebar", "true")
-        panel.setFixedWidth(300)
-        layout = QVBoxLayout(panel)
+    # def _build_tests_panel(self, states_panel: QFrame) -> QFrame:
+    #     panel = self._panel_frame()
+    #     panel.setProperty("sidebar", "true")
+    #     panel.setFixedWidth(300)
+    #     layout = QVBoxLayout(panel)
 
-        head = QLabel("Painel de Testes")
-        head.setObjectName("subtitle")
-        layout.addWidget(head)
+    #     head = QLabel("Painel de Testes")
+    #     head.setObjectName("subtitle")
+    #     layout.addWidget(head)
 
-        self.toggle_pa = ToggleSliderButton("PA Acoplado")
-        self.toggle_pa.setChecked(self.receiver.pa_active)
-        self.toggle_pa.setMinimumSize(260, 54)
+    #     self.toggle_pa = ToggleSliderButton("PA Acoplado")
+    #     self.toggle_pa.setChecked(self.receiver.pa_active)
+    #     self.toggle_pa.setMinimumSize(260, 54)
 
-        self.toggle_pa.toggled.connect(self._set_pa_active)
+    #     self.toggle_pa.toggled.connect(self._set_pa_active)
 
-        layout.addWidget(self.toggle_pa)
-        layout.addSpacing(8)
-        layout.addWidget(states_panel, 1)
-        layout.addStretch(1)
-        return panel
+    #     layout.addWidget(self.toggle_pa)
+    #     layout.addSpacing(8)
+    #     layout.addWidget(states_panel, 1)
+    #     layout.addStretch(1)
+    #     return panel
 
     def _build_maneuver_panel(self) -> QFrame:
         panel = self._panel_frame()
         layout = QVBoxLayout(panel)
 
-        head = QLabel("Painel de Manobras")
+        head = QLabel("Painel de Manobras (Autopiloto)")
         head.setObjectName("subtitle")
         layout.addWidget(head)
 
@@ -339,31 +375,90 @@ class SccaDashboard(QMainWindow):
         matrix.setSpacing(10)
 
         self.maneuver_buttons: dict[str, QPushButton] = {}
-        maneuvers = self.receiver.list_maneuvers()
+        # Lista de manobras disponíveis
+        maneuvers = ["Manobra 1", "Manobra 2", "Manobra 3", "Manobra 4"]
+        
         for idx, name in enumerate(maneuvers):
             btn = QPushButton(name)
             btn.setObjectName("matrixTile")
             btn.setProperty("tileKind", "maneuver")
             btn.setProperty("runState", "idle")
+            btn.setCheckable(True)
             btn.setMinimumSize(170, 96)
-            btn.clicked.connect(lambda _checked=False, mn=name: self._run_maneuver(mn))
+            btn.toggled.connect(lambda checked, mn=name: self._toggle_maneuver_command(mn, checked))
             self.maneuver_buttons[name] = btn
             matrix.addWidget(btn, idx // 2, idx % 2)
 
-        self.pane_tile = QPushButton("Pane Hidraulica")
+        self.pane_tile = QPushButton("Falha Hidraulica")
         self.pane_tile.setObjectName("matrixTile")
         self.pane_tile.setProperty("tileKind", "pane")
         self.pane_tile.setProperty("runState", "idle")
         self.pane_tile.setCheckable(True)
         self.pane_tile.setMinimumSize(170, 96)
-        self.pane_tile.toggled.connect(self._set_hydraulic_failure)
+        self.pane_tile.toggled.connect(self._send_hydraulic_failure_command)
         matrix.addWidget(self.pane_tile, 1, 1)
 
-        self.maneuver_hint = QLabel("Clique na manobra para iniciar | Verde: em execucao")
+        self.maneuver_hint = QLabel("Clique em uma manobra para enviar comando ao Raspberry Pi")
         self.maneuver_hint.setObjectName("subtitle")
 
         layout.addLayout(matrix)
         layout.addWidget(self.maneuver_hint)
+        layout.addStretch(1)
+        return panel
+
+    def _build_udp_panel(self) -> QFrame:
+        """Painel para monitoramento de dados UDP do Raspberry Pi."""
+        panel = self._panel_frame()
+        layout = QVBoxLayout(panel)
+
+        head = QLabel("Status UDP - Telemetria do Raspberry Pi")
+        head.setObjectName("subtitle")
+        layout.addWidget(head)
+
+        # Status de conexão
+        conn_row = QHBoxLayout()
+        conn_label = QLabel("Status UDP:")
+        conn_label.setObjectName("subtitle")
+        self.udp_status_led = LedIndicator("#16ff9a")
+        conn_row.addWidget(conn_label)
+        conn_row.addWidget(self.udp_status_led)
+        conn_row.addStretch(1)
+        layout.addLayout(conn_row)
+
+        # Display dos dados recebidos
+        self.udp_data_info = QLabel("Aguardando dados UDP...")
+        self.udp_data_info.setObjectName("subtitle")
+        self.udp_data_info.setStyleSheet("color: #82d8ff; font-size: 11px;")
+        layout.addWidget(self.udp_data_info)
+
+        self.udp_endpoints_info = QLabel(
+            f"Escutando telemetria em 0.0.0.0:12345 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
+        )
+        self.udp_endpoints_info.setObjectName("subtitle")
+        self.udp_endpoints_info.setStyleSheet("color: #9db3c9; font-size: 10px;")
+        layout.addWidget(self.udp_endpoints_info)
+
+        # Contador de pacotes
+        self.udp_packet_count = QLabel("Pacotes recebidos: 0")
+        self.udp_packet_count.setObjectName("subtitle")
+        self.udp_packet_count.setStyleSheet("color: #7f93a8; font-size: 10px;")
+        layout.addWidget(self.udp_packet_count)
+
+        # Display do último pacote
+        self.udp_last_packet = QLabel("[Últimos dados do sensor]")
+        self.udp_last_packet.setObjectName("subtitle")
+        self.udp_last_packet.setStyleSheet(
+            "color: #16ff9a; font-size: 10px; font-family: 'Courier New'; "
+            "background-color: rgba(10, 20, 30, 150); padding: 6px; border-radius: 4px;"
+        )
+        self.udp_last_packet.setWordWrap(True)
+        layout.addWidget(self.udp_last_packet)
+
+        self.toggle_mock_mode = ToggleSliderButton("Simular Raspberry (Local)")
+        self.toggle_mock_mode.setMinimumSize(250, 42)
+        self.toggle_mock_mode.toggled.connect(self._toggle_mock_mode)
+        layout.addWidget(self.toggle_mock_mode)
+
         layout.addStretch(1)
         return panel
 
@@ -372,42 +467,46 @@ class SccaDashboard(QMainWindow):
         tile.style().polish(tile)
         tile.update()
 
-    def _run_maneuver(self, name: str) -> None:
-        self.receiver.set_selected_maneuver(name)
-        if not self.receiver.pa_active:
-            self.maneuver_hint.setText(f"{name} selecionada | Acople o PA para iniciar")
-            return
-        self.receiver.start_maneuver(name)
+    def _toggle_maneuver_command(self, maneuver_name: str, enabled: bool) -> None:
+        """Liga/desliga execução de manobra no Raspberry Pi."""
+        if enabled:
+            self.logger.info(f"Enviando comando de manobra: {maneuver_name}")
+            self.command_sender.send_maneuver_command(maneuver_name, action="start")
+            self.maneuver_hint.setText(f"Comando enviado: {maneuver_name} | Executando...")
+        else:
+            self.logger.info(f"Cancelando manobra: {maneuver_name}")
+            self.command_sender.send_maneuver_stop(maneuver_name)
+            self.maneuver_hint.setText(f"Comando enviado: {maneuver_name} | Cancelada")
 
-    def _update_maneuver_tiles(self, data: dict) -> None:
-        active = data.get("maneuver_active", False)
-        selected = data.get("selected_maneuver", "")
+    def _send_hydraulic_failure_command(self, enabled: bool) -> None:
+        """Envia comando de simulação de falha hidráulica."""
+        status = "ativado" if enabled else "desativado"
+        self.logger.info(f"Enviando comando: Pane hidráulica {status}")
+        self.command_sender.send_system_command("set_hydraulic_failure", enabled)
+        self.maneuver_hint.setText(f"Pane hidráulica {status}")
 
-        for name, btn in self.maneuver_buttons.items():
-            state = "active" if active and name == selected else "idle"
-            if btn.property("runState") != state:
-                btn.setProperty("runState", state)
-                self._refresh_tile_style(btn)
+    def _toggle_mock_mode(self, enabled: bool) -> None:
+        if enabled:
+            ok = self.mock_raspberry.start(interval_ms=100)
+            if ok:
+                self.maneuver_hint.setText("Mock Raspberry ativo | Comandos locais habilitados")
+            else:
+                self.toggle_mock_mode.blockSignals(True)
+                self.toggle_mock_mode.setChecked(False)
+                self.toggle_mock_mode.blockSignals(False)
+        else:
+            self.mock_raspberry.stop()
+            self.maneuver_hint.setText("Mock Raspberry desativado")
 
-        pane_on = data.get("hydraulic_failure", False)
-        if self.pane_tile.isChecked() != pane_on:
-            self.pane_tile.blockSignals(True)
-            self.pane_tile.setChecked(pane_on)
-            self.pane_tile.blockSignals(False)
-        pane_state = "active" if pane_on else "idle"
-        if self.pane_tile.property("runState") != pane_state:
-            self.pane_tile.setProperty("runState", pane_state)
-            self._refresh_tile_style(self.pane_tile)
+    def _on_mock_status_changed(self, running: bool) -> None:
+        if running:
+            self.udp_data_info.setText("Mock Raspberry ativo - enviando telemetria")
+        else:
+            self.udp_data_info.setText("Mock Raspberry parado")
 
-        state_text_map = {
-            "RUNNING": "Em execucao",
-            "COMPLETED": "Concluida",
-            "ABORTED": "Abortada (PA desacoplado)",
-            "IDLE": "Pronta",
-        }
-        state_raw = data.get("maneuver_state", "IDLE")
-        state_text = state_text_map.get(state_raw, state_raw)
-        self.maneuver_hint.setText(f"{selected} | Status: {state_text}")
+    def _on_mock_error(self, error_msg: str) -> None:
+        self.logger.error(f"Mock Raspberry error: {error_msg}")
+        self.udp_data_info.setText(f"ERRO MOCK: {error_msg}")
 
     def _set_state(self, label: QLabel, state: str) -> None:
         label.setProperty("state", state)
@@ -421,40 +520,59 @@ class SccaDashboard(QMainWindow):
         self.alert_lbl.style().unpolish(self.alert_lbl)
         self.alert_lbl.style().polish(self.alert_lbl)
 
-    def _set_pa_active(self, enabled: bool) -> None:
-        self.receiver.set_pa_active(enabled)
+    def _extract_telemetry(self, packet_dict: dict) -> dict:
+        """Normaliza o payload UDP para o mesmo formato usado pela GUI."""
+        parsed = packet_dict.get("parsed_data", packet_dict)
+        if not isinstance(parsed, dict):
+            return {}
 
-    def _set_hydraulic_failure(self, enabled: bool) -> None:
-        self.receiver.set_hydraulic_failure(enabled)
+        def to_float(value: object, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
 
-    def update_dashboard(self, data: dict) -> None:
-        self.position_bar.setValue(int(data["position_percent"] * 10))
+        telemetry = {
+            "position_percent": to_float(parsed.get("position_percent", parsed.get("position", 0.0)), 0.0),
+            "trim_hold": bool(parsed.get("trim_hold", False)),
+            "beep_trim": str(parsed.get("beep_trim", "NEUTRAL")),
+            "pa_active": bool(parsed.get("pa_active", False)),
+            "hydraulic_failure": bool(parsed.get("hydraulic_failure", False)),
+            "pilot_force_kg": to_float(parsed.get("pilot_force_kg", parsed.get("pilot_force", 0.0)), 0.0),
+            "udp_connected": bool(parsed.get("udp_connected", True)),
+            "usb_connected": bool(parsed.get("usb_connected", True)),
+            "selected_maneuver": str(parsed.get("selected_maneuver", "Manobra 1")),
+            "maneuver_active": bool(parsed.get("maneuver_active", False)),
+            "maneuver_state": str(parsed.get("maneuver_state", "IDLE")),
+            "timestamp": to_float(parsed.get("timestamp", packet_dict.get("timestamp", time.time())), time.time()),
+        }
+        required_keys = ("position_percent", "pilot_force_kg", "trim_hold")
+        if not all(k in parsed for k in required_keys):
+            return {}
+        return telemetry
+
+    def _apply_dashboard_telemetry(self, data: dict, source: str) -> None:
+        """Atualiza os widgets principais com a telemetria recebida."""
+        self.position_bar.setValue(int(max(0.0, min(100.0, data["position_percent"])) * 10))
         self.position_display.setText(f"{data['position_percent']:.1f}%")
         self.force_gauge.set_force_kg(data["pilot_force_kg"])
 
         trim_hold = data["trim_hold"]
         self._set_state(self.trim_hold_lbl, "ok" if trim_hold else "off")
-        self._set_state(self.trim_release_lbl, "warn" if not trim_hold else "off")
+        self._set_state(self.trim_release_lbl, "ok" if not trim_hold else "off")
 
         beep_trim = data["beep_trim"]
         self._set_state(self.beep_up_lbl, "ok" if beep_trim == "UP" else "off")
-        self._set_state(self.beep_down_lbl, "warn" if beep_trim == "DOWN" else "off")
+        self._set_state(self.beep_down_lbl, "ok" if beep_trim == "DOWN" else "off")
 
         pa_active = data["pa_active"]
         self._set_state(self.pa_active_lbl, "ok" if pa_active else "off")
-        self._set_state(self.pa_override_lbl, "warn" if not pa_active else "off")
-
-        if self.toggle_pa.isChecked() != pa_active:
-            self.toggle_pa.blockSignals(True)
-            self.toggle_pa.setChecked(pa_active)
-            self.toggle_pa.blockSignals(False)
+        self._set_state(self.pa_override_lbl, "ok" if not pa_active else "off")
 
         self.udp_led.set_on(data["udp_connected"])
         self.usb_led.set_on(data["usb_connected"])
 
         has_failure = data["hydraulic_failure"]
-        self._update_maneuver_tiles(data)
-
         self.alert_lbl.setVisible(has_failure)
         if has_failure and not self.flash_timer.isActive():
             self.flash_timer.start()
@@ -462,9 +580,114 @@ class SccaDashboard(QMainWindow):
             self.flash_timer.stop()
             self.alert_lbl.setProperty("flash", "false")
 
+        # Atualizar tiles de manobra com base no estado recebido
+        active = data.get("maneuver_active", False)
+        selected = data.get("selected_maneuver", "")
+
+        for name, btn in self.maneuver_buttons.items():
+            state = "active" if active and name == selected else "idle"
+            if btn.property("runState") != state:
+                btn.setProperty("runState", state)
+                self._refresh_tile_style(btn)
+
+            should_be_checked = active and name == selected
+            if btn.isChecked() != should_be_checked:
+                btn.blockSignals(True)
+                btn.setChecked(should_be_checked)
+                btn.blockSignals(False)
+
+        # Atualizar pane_tile
+        pane_on = data.get("hydraulic_failure", False)
+        if self.pane_tile.isChecked() != pane_on:
+            self.pane_tile.blockSignals(True)
+            self.pane_tile.setChecked(pane_on)
+            self.pane_tile.blockSignals(False)
+        pane_state = "active" if pane_on else "idle"
+        if self.pane_tile.property("runState") != pane_state:
+            self.pane_tile.setProperty("runState", pane_state)
+            self._refresh_tile_style(self.pane_tile)
+
+        # Atualizar hint com status de manobra
+        state_text_map = {
+            "RUNNING": "Em execução",
+            "COMPLETED": "Concluída",
+            "ABORTED": "Abortada",
+            "IDLE": "Pronta",
+        }
+        state_raw = data.get("maneuver_state", "IDLE")
+        state_text = state_text_map.get(state_raw, state_raw)
+        self.maneuver_hint.setText(f"{selected} | Status: {state_text}")
+
+    def _on_udp_packet_received(self, packet_dict: dict) -> None:
+        """Handler para pacotes UDP recebidos do Raspberry Pi."""
+        self._udp_packet_num = getattr(self, "_udp_packet_num", 0) + 1
+        self._last_udp_packet_time = time.time()
+
+        # Atualizar contador
+        self.udp_packet_count.setText(f"Pacotes recebidos: {self._udp_packet_num}")
+
+        # Extrair informações do pacote
+        sender = packet_dict.get("sender_address", "?")
+        port = packet_dict.get("sender_port", "?")
+        fmt = packet_dict.get("parse_format", "?")
+        length = packet_dict.get("raw_length", 0)
+
+        # Direcionar comandos para o IP que está enviando telemetria
+        if isinstance(sender, str) and sender and sender != "?" and sender != self._command_target_host:
+            self._command_target_host = sender
+            self.command_sender.set_target(receiver_host=self._command_target_host, receiver_port=self._command_target_port)
+            self.logger.info(f"Destino de comandos ajustado para {self._command_target_host}:{self._command_target_port}")
+            self.udp_endpoints_info.setText(
+                f"Escutando telemetria em 0.0.0.0:12345 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
+            )
+
+        self.udp_data_info.setText(
+            f"Sensores: {sender}:{port} | Formato: {fmt} | Tamanho: {length} bytes"
+        )
+
+        # Mostrar dados parseados
+        parsed = packet_dict.get("parsed_data", {})
+        if parsed:
+            display_text = str(parsed)
+            # Limitar a exibição às últimas 2 linhas
+            if len(display_text) > 200:
+                display_text = "..." + display_text[-200:]
+            self.udp_last_packet.setText(display_text)
+
+        telemetry = self._extract_telemetry(packet_dict)
+        if telemetry:
+            self._apply_dashboard_telemetry(telemetry, source="udp")
+
+    def _on_udp_error(self, error_msg: str) -> None:
+        """Handler para erros UDP."""
+        self.logger.error(f"UDP Error: {error_msg}")
+        self.udp_data_info.setText(f"ERRO: {error_msg}")
+        self.udp_status_led.set_on(False)
+
+    def _on_udp_connection_changed(self, connected: bool) -> None:
+        """Handler para mudanças no status de conexão UDP."""
+        self.udp_status_led.set_on(connected)
+        if connected:
+            self.udp_data_info.setText("Servidor UDP ativo - aguardando dados do Raspberry Pi...")
+        else:
+            self.udp_data_info.setText("Servidor UDP desconectado")
+
+    def _on_command_sent(self, command_data: dict) -> None:
+        """Handler quando comando é enviado para Raspberry Pi."""
+        cmd_type = command_data.get("command_type", "unknown")
+        self.logger.info(f"Comando enviado: {cmd_type} - {command_data}")
+        if cmd_type == "maneuver":
+            maneuver_name = command_data.get("maneuver_name", "?")
+            self.maneuver_hint.setText(f"Comando enviado: {maneuver_name}")
+
+    def _on_command_error(self, error_msg: str) -> None:
+        """Handler para erros ao enviar comandos."""
+        self.logger.error(f"Command Error: {error_msg}")
+        self.maneuver_hint.setText(f"Erro ao enviar: {error_msg}")
+
     def closeEvent(self, event) -> None:
-        self.worker.stop()
-        self.worker.wait(600)
+        self.mock_raspberry.stop()
+        self.udp_receiver.stop()
         super().closeEvent(event)
 
 
