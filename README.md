@@ -46,6 +46,63 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Teste fim a fim sem Raspberry
+
+Para validar localmente o protocolo UDP CSV completo (Dashboard <-> Raspberry simulado), execute:
+
+```bash
+./scripts/run_full_udp_sim_test.sh
+```
+
+Esse comando:
+- compila `raspberry_pi/udp_sender_example.cpp` em `/tmp/udp_csv_test`
+- sobe um teste automatizado que simula a interface enviando pacotes `P,...`
+- valida recebimento de pacotes `C,...` e imprime resumo (sucesso/falha)
+
+Opcoes uteis:
+
+```bash
+./scripts/run_full_udp_sim_test.sh --duration 10 --interval-ms 100
+```
+
+## Modo ao vivo (interface + simulador local)
+
+Para abrir a interface e manter o simulador do Raspberry rodando em paralelo:
+
+```bash
+./scripts/run_live_udp_dashboard.sh
+```
+
+Em outro terminal, acompanhe os pacotes em tempo real:
+
+```bash
+tail -f .logs/udp_simulator.log
+```
+
+Voce deve ver linhas como:
+- `TX C: C,...` (telemetria enviada para o dashboard)
+- `RX P: autopilot=...` (controle recebido do dashboard)
+
+Observacao:
+- Nao e travamento: tanto o dashboard quanto o simulador sao processos continuos.
+- O script encerra o simulador automaticamente quando voce fecha a janela do dashboard.
+
+## Simular dados variando do Raspberry (telemetria C)
+
+Se quiser apenas simular o envio de telemetria do Raspberry para confirmar animacao do dashboard:
+
+```bash
+./scripts/run_dashboard_with_fake_raspberry.sh
+```
+
+Esse modo usa `scripts/simulate_raspberry_telemetry.py` para enviar pacotes `C,...` com valores variando em tempo real.
+
+Para ver os pacotes enviados:
+
+```bash
+tail -f .logs/fake_raspberry.log
+```
+
 ## Estrutura
 
 - `main.py`: ponto de entrada
