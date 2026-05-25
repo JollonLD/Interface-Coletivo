@@ -174,7 +174,15 @@ class SccaDashboard(QMainWindow):
             initial_port = 12346
             self.logger = logging.getLogger("Dashboard")
             self.logger.warning("SCCA_COMMAND_PORT inválida; usando 12346")
-        self.command_sender = CommandSender(receiver_host=initial_host, receiver_port=initial_port)
+        try:
+            initial_interval_ms = int(os.getenv("SCCA_COMMAND_INTERVAL_MS", "50"))
+        except ValueError:
+            initial_interval_ms = 50
+        self.command_sender = CommandSender(
+            receiver_host=initial_host,
+            receiver_port=initial_port,
+            send_interval_ms=initial_interval_ms,
+        )
         self.command_sender.command_sent.connect(self._on_command_sent)
         self.command_sender.error_occurred.connect(self._on_command_error)
         self._command_target_host = initial_host
@@ -229,12 +237,24 @@ class SccaDashboard(QMainWindow):
         self.flash_timer.timeout.connect(self._toggle_alert_flash)
         self._flash_on = False
         self._last_udp_packet_time = 0.0
+
+        # Estado local do comando enviado ao Raspberry (pacote P)
+        self._control_tick_s = max(0.05, min(0.15, initial_interval_ms / 1000.0))
+        self._control_time_s = 0.0
+        self._transducer_cmd = 0
+        self._selected_maneuver_name = "Manobra 1"
+
+        self.control_timer = QTimer(self)
+        self.control_timer.setInterval(int(self._control_tick_s * 1000.0))
+        self.control_timer.timeout.connect(self._update_control_stream_state)
         
         # Logger
         self.logger = logging.getLogger("Dashboard")
 
         # Iniciar servidor UDP
         self.udp_receiver.start()
+        self.command_sender.start_stream()
+        self.control_timer.start()
 
     def _panel_frame(self) -> QFrame:
         frame = QFrame()
@@ -470,8 +490,15 @@ class SccaDashboard(QMainWindow):
     def _toggle_maneuver_command(self, maneuver_name: str, enabled: bool) -> None:
         """Liga/desliga execução de manobra no Raspberry Pi."""
         if enabled:
+            # Apenas uma manobra deve ficar ativa por vez.
+            for name, btn in self.maneuver_buttons.items():
+                if name != maneuver_name and btn.isChecked():
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
             self.logger.info(f"Enviando comando de manobra: {maneuver_name}")
             self.command_sender.send_maneuver_command(maneuver_name, action="start")
+            self._selected_maneuver_name = maneuver_name
             self.maneuver_hint.setText(f"Comando enviado: {maneuver_name} | Executando...")
         else:
             self.logger.info(f"Cancelando manobra: {maneuver_name}")
@@ -520,6 +547,42 @@ class SccaDashboard(QMainWindow):
         self.alert_lbl.style().unpolish(self.alert_lbl)
         self.alert_lbl.style().polish(self.alert_lbl)
 
+    def _get_active_maneuver_name(self) -> str | None:
+        for name, btn in self.maneuver_buttons.items():
+            if btn.isChecked():
+                return name
+        return None
+
+    def _maneuver_transducer_profile(self, maneuver_name: str, t: float) -> int:
+        if maneuver_name == "Manobra 2":
+            return int(12000 + 7000 * math.sin(0.75 * t))
+        if maneuver_name == "Manobra 3":
+            return int(15000 + 5000 * math.sin(1.15 * t + 0.6))
+        if maneuver_name == "Manobra 4":
+            phase = int((t / 1.2) % 4)
+            levels = [4000, 11000, 18000, 7000]
+            return levels[phase]
+        return int(10000 + 6000 * math.sin(0.55 * t))
+
+    def _update_control_stream_state(self) -> None:
+        active_maneuver = self._get_active_maneuver_name()
+        autopilot_active = active_maneuver is not None
+        hydraulic_failure = bool(self.pane_tile.isChecked())
+
+        self._control_time_s += self._control_tick_s
+        if autopilot_active and active_maneuver is not None:
+            self._selected_maneuver_name = active_maneuver
+            self._transducer_cmd = self._maneuver_transducer_profile(active_maneuver, self._control_time_s)
+        else:
+            # Sem manobra ativa, retorna o comando para zero sem salto brusco.
+            self._transducer_cmd = int(self._transducer_cmd * 0.85)
+
+        self.command_sender.set_control_state(
+            autopilot_active=autopilot_active,
+            hydraulic_failure=hydraulic_failure,
+            transducer_position=max(0, self._transducer_cmd),
+        )
+
     def _extract_telemetry(self, packet_dict: dict) -> dict:
         """Normaliza o payload UDP para o mesmo formato usado pela GUI."""
         parsed = packet_dict.get("parsed_data", packet_dict)
@@ -532,24 +595,37 @@ class SccaDashboard(QMainWindow):
             except (TypeError, ValueError):
                 return default
 
-        telemetry = {
-            "position_percent": to_float(parsed.get("position_percent", parsed.get("position", 0.0)), 0.0),
-            "trim_hold": bool(parsed.get("trim_hold", False)),
-            "beep_trim": str(parsed.get("beep_trim", "NEUTRAL")),
-            "pa_active": bool(parsed.get("pa_active", False)),
-            "hydraulic_failure": bool(parsed.get("hydraulic_failure", False)),
-            "pilot_force_kg": to_float(parsed.get("pilot_force_kg", parsed.get("pilot_force", 0.0)), 0.0),
-            "udp_connected": bool(parsed.get("udp_connected", True)),
-            "usb_connected": bool(parsed.get("usb_connected", True)),
-            "selected_maneuver": str(parsed.get("selected_maneuver", "Manobra 1")),
-            "maneuver_active": bool(parsed.get("maneuver_active", False)),
-            "maneuver_state": str(parsed.get("maneuver_state", "IDLE")),
-            "timestamp": to_float(parsed.get("timestamp", packet_dict.get("timestamp", time.time())), time.time()),
-        }
-        required_keys = ("position_percent", "pilot_force_kg", "trim_hold")
-        if not all(k in parsed for k in required_keys):
-            return {}
-        return telemetry
+        if all(k in parsed for k in ("beep_trim_up", "beep_trim_down", "trim_release", "override", "load_cell")):
+            beep_up = int(parsed.get("beep_trim_up", 0))
+            beep_down = int(parsed.get("beep_trim_down", 0))
+            trim_release = int(parsed.get("trim_release", 0))
+            override = int(parsed.get("override", 0))
+            load_cell = int(parsed.get("load_cell", 0))
+
+            if beep_up:
+                beep_trim = "UP"
+            elif beep_down:
+                beep_trim = "DOWN"
+            else:
+                beep_trim = "NEUTRAL"
+
+            position_proxy = max(0.0, min(100.0, (to_float(load_cell, 0.0) / 1023.0) * 100.0))
+            return {
+                "position_percent": position_proxy,
+                "trim_hold": trim_release == 0,
+                "beep_trim": beep_trim,
+                "pa_active": override == 0,
+                "hydraulic_failure": bool(self.pane_tile.isChecked()),
+                "pilot_force_kg": max(0.0, to_float(load_cell, 0.0) / 10.0),
+                "udp_connected": True,
+                "usb_connected": True,
+                "selected_maneuver": next((n for n, b in self.maneuver_buttons.items() if b.isChecked()), "Manobra 1"),
+                "maneuver_active": any(btn.isChecked() for btn in self.maneuver_buttons.values()),
+                "maneuver_state": "RUNNING" if any(btn.isChecked() for btn in self.maneuver_buttons.values()) else "IDLE",
+                "timestamp": to_float(packet_dict.get("timestamp", time.time()), time.time()),
+            }
+
+        return {}
 
     def _apply_dashboard_telemetry(self, data: dict, source: str) -> None:
         """Atualiza os widgets principais com a telemetria recebida."""
@@ -675,7 +751,8 @@ class SccaDashboard(QMainWindow):
     def _on_command_sent(self, command_data: dict) -> None:
         """Handler quando comando é enviado para Raspberry Pi."""
         cmd_type = command_data.get("command_type", "unknown")
-        self.logger.info(f"Comando enviado: {cmd_type} - {command_data}")
+        if cmd_type != "control_stream":
+            self.logger.info(f"Comando enviado: {cmd_type} - {command_data}")
         if cmd_type == "maneuver":
             maneuver_name = command_data.get("maneuver_name", "?")
             self.maneuver_hint.setText(f"Comando enviado: {maneuver_name}")
@@ -687,6 +764,9 @@ class SccaDashboard(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.mock_raspberry.stop()
+        if self.control_timer.isActive():
+            self.control_timer.stop()
+        self.command_sender.stop_stream()
         self.udp_receiver.stop()
         super().closeEvent(event)
 

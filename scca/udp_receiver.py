@@ -7,7 +7,6 @@ robusto de erros e sinais Qt para integração com threads GUI.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import struct
@@ -194,14 +193,21 @@ class UDPReceiver(QObject):
             "parse_format": "hex_raw",
         }
 
-        # Tentar JSON
+        # Protocolo principal: CSV iniciando com 'C'
         try:
             decoded_str = data.decode("utf-8")
-            parsed = json.loads(decoded_str)
-            result["parsed_data"] = parsed
-            result["parse_format"] = "json"
-            return result
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            parts = [part.strip() for part in decoded_str.strip().split(",")]
+            if len(parts) == 6 and parts[0] == "C":
+                result["parsed_data"] = {
+                    "beep_trim_up": int(parts[1]),
+                    "beep_trim_down": int(parts[2]),
+                    "trim_release": int(parts[3]),
+                    "override": int(parts[4]),
+                    "load_cell": int(parts[5]),
+                }
+                result["parse_format"] = "csv_c"
+                return result
+        except (ValueError, UnicodeDecodeError):
             pass
 
         # Tentar interpretação como string ASCII
@@ -279,23 +285,12 @@ class MockUDPSender(QObject):
         hydraulic_failure = False
         pilot_force = 2.0 + 1.5 * math.sin(self._packet_num * 3.14159 / 5.0)
 
-        # Enviar como JSON (formato recomendado)
-        test_data = {
-            "position_percent": position,
-            "trim_hold": trim_hold,
-            "beep_trim": beep_trim,
-            "pa_active": pa_active,
-            "hydraulic_failure": hydraulic_failure,
-            "pilot_force_kg": pilot_force,
-            "udp_connected": True,
-            "usb_connected": True,
-            "selected_maneuver": "Circuito Classico",
-            "maneuver_active": False,
-            "maneuver_state": "IDLE",
-            "timestamp": time.time(),
-        }
-
-        data = json.dumps(test_data).encode("utf-8")
+        beep_up = 1 if beep_trim == "UP" else 0
+        beep_down = 1 if beep_trim == "DOWN" else 0
+        trim_release = 0 if trim_hold else 1
+        override = 0 if pa_active else 1
+        load_cell = int(round(pilot_force * 10.0))
+        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
         self.socket.writeDatagram(
             data,
             QHostAddress(self.receiver_host),
@@ -316,7 +311,12 @@ class CommandSender(QObject):
     command_sent = Signal(dict)  # Sinal quando comando é enviado
     error_occurred = Signal(str)  # Sinal de erro ao enviar
     
-    def __init__(self, receiver_host: str = "127.0.0.1", receiver_port: int = 12346) -> None:
+    def __init__(
+        self,
+        receiver_host: str = "127.0.0.1",
+        receiver_port: int = 12346,
+        send_interval_ms: int = 50,
+    ) -> None:
         """
         Inicializa o enviador de comandos.
         
@@ -328,6 +328,12 @@ class CommandSender(QObject):
         self.receiver_host = receiver_host
         self.receiver_port = receiver_port
         self.socket = QUdpSocket(self)
+        self.autopilot_active = False
+        self.hydraulic_failure = False
+        self.transducer_position = 0
+        self._send_interval_ms = max(50, min(150, int(send_interval_ms)))
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._send_periodic_control)
 
     def set_target(self, receiver_host: str, receiver_port: Optional[int] = None) -> None:
         """Atualiza dinamicamente o destino dos comandos (IP/porta do Raspberry Pi)."""
@@ -335,6 +341,77 @@ class CommandSender(QObject):
         if receiver_port is not None:
             self.receiver_port = receiver_port
         logger.info(f"Destino de comandos atualizado para {self.receiver_host}:{self.receiver_port}")
+
+    def set_send_interval_ms(self, interval_ms: int) -> None:
+        """Ajusta intervalo de envio periódico no range 50-150 ms."""
+        self._send_interval_ms = max(50, min(150, int(interval_ms)))
+        if self._timer.isActive():
+            self._timer.start(self._send_interval_ms)
+
+    def start_stream(self) -> None:
+        """Inicia streaming periódico do pacote de controle 'P'."""
+        if not self._timer.isActive():
+            self._timer.start(self._send_interval_ms)
+            logger.info(
+                f"Stream de controle UDP iniciado ({self._send_interval_ms} ms) para "
+                f"{self.receiver_host}:{self.receiver_port}"
+            )
+
+    def stop_stream(self) -> None:
+        """Para streaming periódico do pacote de controle 'P'."""
+        if self._timer.isActive():
+            self._timer.stop()
+
+    def set_control_state(
+        self,
+        autopilot_active: Optional[bool] = None,
+        hydraulic_failure: Optional[bool] = None,
+        transducer_position: Optional[int] = None,
+    ) -> None:
+        if autopilot_active is not None:
+            self.autopilot_active = bool(autopilot_active)
+        if hydraulic_failure is not None:
+            self.hydraulic_failure = bool(hydraulic_failure)
+        if transducer_position is not None:
+            self.transducer_position = int(transducer_position)
+
+    def _build_control_payload(self) -> bytes:
+        return (
+            f"P,{int(self.autopilot_active)},{int(self.hydraulic_failure)},"
+            f"{int(self.transducer_position)}"
+        ).encode("utf-8")
+
+    def _send_periodic_control(self) -> None:
+        self._send_control_packet()
+
+    def _send_control_packet(self) -> bool:
+        try:
+            data = self._build_control_payload()
+            sent = self.socket.writeDatagram(
+                data,
+                QHostAddress(self.receiver_host),
+                self.receiver_port,
+            )
+            if sent == len(data):
+                self.command_sent.emit(
+                    {
+                        "command_type": "control_stream",
+                        "autopilot_active": self.autopilot_active,
+                        "hydraulic_failure": self.hydraulic_failure,
+                        "transducer_position": self.transducer_position,
+                    }
+                )
+                return True
+
+            error_msg = f"Falha ao enviar controle: enviados {sent} de {len(data)} bytes"
+            logger.error(error_msg)
+            self.error_occurred.emit(error_msg)
+            return False
+        except Exception as e:
+            error_msg = f"Exceção ao enviar controle: {str(e)}"
+            logger.error(error_msg)
+            self.error_occurred.emit(error_msg)
+            return False
     
     def send_maneuver_command(
         self,
@@ -353,36 +430,10 @@ class CommandSender(QObject):
             bool: True se enviado com sucesso, False caso contrário
         """
         try:
-            import time
-            
-            command_data = {
-                "command_type": "maneuver",
-                "maneuver_name": maneuver_name,
-                "action": action,
-                "parameters": parameters or {},
-                "timestamp": time.time(),
-            }
-            
-            data = json.dumps(command_data).encode("utf-8")
-            sent = self.socket.writeDatagram(
-                data,
-                QHostAddress(self.receiver_host),
-                self.receiver_port,
-            )
-            
-            if sent == len(data):
-                logger.info(
-                    f"Comando enviado: manobra '{maneuver_name}' ({action}) para "
-                    f"{self.receiver_host}:{self.receiver_port}"
-                )
-                self.command_sent.emit(command_data)
-                return True
-            else:
-                error_msg = f"Falha ao enviar comando: enviados {sent} de {len(data)} bytes"
-                logger.error(error_msg)
-                self.error_occurred.emit(error_msg)
-                return False
-                
+            del maneuver_name
+            del parameters
+            self.set_control_state(autopilot_active=(str(action).lower() != "stop"))
+            return self._send_control_packet()
         except Exception as e:
             error_msg = f"Exceção ao enviar comando: {str(e)}"
             logger.error(error_msg)
@@ -396,30 +447,11 @@ class CommandSender(QObject):
     def send_system_command(self, command: str, value: object) -> bool:
         """Envia comando de sistema (ex.: set_hydraulic_failure) para o Raspberry Pi."""
         try:
-            import time
+            if command == "set_hydraulic_failure":
+                self.set_control_state(hydraulic_failure=bool(value))
+                return self._send_control_packet()
 
-            command_data = {
-                "command_type": "system",
-                "command": command,
-                "value": value,
-                "timestamp": time.time(),
-            }
-
-            data = json.dumps(command_data).encode("utf-8")
-            sent = self.socket.writeDatagram(
-                data,
-                QHostAddress(self.receiver_host),
-                self.receiver_port,
-            )
-
-            if sent == len(data):
-                logger.info(
-                    f"Comando de sistema enviado: {command}={value} para {self.receiver_host}:{self.receiver_port}"
-                )
-                self.command_sent.emit(command_data)
-                return True
-
-            error_msg = f"Falha ao enviar comando de sistema: enviados {sent} de {len(data)} bytes"
+            error_msg = f"Comando de sistema não suportado no protocolo CSV: {command}"
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
             return False
@@ -442,39 +474,12 @@ class CommandSender(QObject):
         Returns:
             bool: True se enviado com sucesso
         """
-        try:
-            import time
-
-            command_data = {
-                "command_type": "control",
-                "position_percent": float(position_percent),
-                "trim_hold": bool(trim_hold),
-                "beep_trim": str(beep_trim),
-                "timestamp": time.time(),
-            }
-
-            data = json.dumps(command_data).encode("utf-8")
-            sent = self.socket.writeDatagram(
-                data,
-                QHostAddress(self.receiver_host),
-                self.receiver_port,
-            )
-
-            if sent == len(data):
-                logger.debug(f"Comando de controle enviado: {command_data}")
-                self.command_sent.emit(command_data)
-                return True
-
-            error_msg = f"Falha ao enviar controle: enviados {sent} de {len(data)} bytes"
-            logger.error(error_msg)
-            self.error_occurred.emit(error_msg)
-            return False
-
-        except Exception as e:
-            error_msg = f"Exceção ao enviar controle: {str(e)}"
-            logger.error(error_msg)
-            self.error_occurred.emit(error_msg)
-            return False
+        del trim_hold
+        del beep_trim
+        self.set_control_state(
+            transducer_position=int(round(float(position_percent) * 100.0)),
+        )
+        return self._send_control_packet()
 
 
 class MockRaspberryAutopilot(QObject):
@@ -519,8 +524,9 @@ class MockRaspberryAutopilot(QObject):
         self.maneuver_state = "IDLE"
         self._t = 0.0
         self._dt = 0.1
+        self._transducer_position = int(self.position_percent * 100.0)
 
-    def start(self, interval_ms: int = 100) -> bool:
+    def start(self, interval_ms: int = 50) -> bool:
         try:
             self.command_socket = QUdpSocket(self)
             if not self.command_socket.bind(QHostAddress(self.command_host), self.command_port):
@@ -562,33 +568,27 @@ class MockRaspberryAutopilot(QObject):
             return
         while self.command_socket.hasPendingDatagrams():
             dg = self.command_socket.receiveDatagram()
-            payload = bytes(dg.data())
+            payload = bytes(dg.data()).decode("utf-8", errors="ignore").strip()
             try:
-                msg = json.loads(payload.decode("utf-8"))
+                parts = [part.strip() for part in payload.split(",")]
+                if len(parts) != 4 or parts[0] != "P":
+                    continue
+                autopilot_active = bool(int(parts[1]))
+                hydraulic_failure = bool(int(parts[2]))
+                transducer_position = int(parts[3])
             except Exception:
                 continue
 
-            cmd_type = msg.get("command_type")
-            if cmd_type == "maneuver":
-                action = str(msg.get("action", "start")).lower()
-                maneuver_name = str(msg.get("maneuver_name", self.selected_maneuver))
-
-                if action == "stop":
-                    self.maneuver_active = False
-                    self.maneuver_state = "IDLE"
-                    self.trim_hold = True
-                else:
-                    self.selected_maneuver = maneuver_name
-                    self.maneuver_active = True
-                    self.maneuver_state = "RUNNING"
-                    self._t = 0.0
-                    self.trim_hold = False
-            elif cmd_type == "system" and msg.get("command") == "set_hydraulic_failure":
-                self.hydraulic_failure = bool(msg.get("value", False))
-                if self.hydraulic_failure:
-                    self.maneuver_active = False
-                    self.maneuver_state = "ABORTED"
-                    self.trim_hold = True
+            self.pa_active = autopilot_active
+            self.hydraulic_failure = hydraulic_failure
+            self._transducer_position = transducer_position
+            self.maneuver_active = autopilot_active
+            self.maneuver_state = "RUNNING" if autopilot_active else "IDLE"
+            self.trim_hold = not autopilot_active
+            if self.hydraulic_failure:
+                self.maneuver_active = False
+                self.maneuver_state = "ABORTED"
+                self.trim_hold = True
 
     def _profile(self, name: str, t: float) -> float:
         if name == "Manobra 2":
@@ -611,7 +611,8 @@ class MockRaspberryAutopilot(QObject):
             self.trim_hold = True
         elif self.maneuver_active:
             prev = self.position_percent
-            self.position_percent = max(0.0, min(100.0, self._profile(self.selected_maneuver, self._t)))
+            target_percent = max(0.0, min(100.0, self._transducer_position / 100.0))
+            self.position_percent += (target_percent - self.position_percent) * 0.25
             slope = self.position_percent - prev
             if slope > 0.2:
                 self.beep_trim = "UP"
@@ -621,34 +622,19 @@ class MockRaspberryAutopilot(QObject):
                 self.beep_trim = "NEUTRAL"
             self.pilot_force_kg = max(0.0, min(8.0, abs(slope) * 0.8 + 1.2))
             self._t += self._dt
-            if self._t >= 20.0:
-                self.maneuver_active = False
-                self.maneuver_state = "COMPLETED"
-                self.trim_hold = True
-                self.beep_trim = "NEUTRAL"
         else:
             self.position_percent = self.position_percent
             self.pilot_force_kg = max(0.0, self.pilot_force_kg * 0.95)
-            if self.maneuver_state not in ("COMPLETED", "ABORTED"):
+            if self.maneuver_state not in ("ABORTED",):
                 self.maneuver_state = "IDLE"
             self.beep_trim = "NEUTRAL"
 
-        telemetry = {
-            "position_percent": self.position_percent,
-            "trim_hold": self.trim_hold,
-            "beep_trim": self.beep_trim,
-            "pa_active": self.pa_active,
-            "hydraulic_failure": self.hydraulic_failure,
-            "pilot_force_kg": self.pilot_force_kg,
-            "udp_connected": self.udp_connected,
-            "usb_connected": self.usb_connected,
-            "selected_maneuver": self.selected_maneuver,
-            "maneuver_active": self.maneuver_active,
-            "maneuver_state": self.maneuver_state,
-            "timestamp": time.time(),
-        }
-
-        data = json.dumps(telemetry).encode("utf-8")
+        beep_up = 1 if self.beep_trim == "UP" else 0
+        beep_down = 1 if self.beep_trim == "DOWN" else 0
+        trim_release = 0 if self.trim_hold else 1
+        override = 0 if self.pa_active else 1
+        load_cell = int(round(self.pilot_force_kg * 10.0))
+        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
         self.telemetry_socket.writeDatagram(
             data,
             QHostAddress(self.telemetry_host),
