@@ -3,19 +3,16 @@
  * ==================================
  *
  * Fluxo Raspberry -> Dashboard (telemetria):
- *   C,<beep_trim_up>,<beep_trim_down>,<trim_release>,<override>,<load_cell>
+ * C,<beep_trim_up>,<beep_trim_down>,<trim_release>,<override>,<load_cell>
  *
  * Fluxo Dashboard -> Raspberry (controle):
- *   P,<autopilot_active>,<hydraulic_failure>,<transducer_position>
+ * P,<autopilot_active>,<hydraulic_failure>,<transducer_position>
  *
  * Compilar:
- *   g++ -std=c++17 -O2 -o udp_csv udp_sender_example.cpp
+ * g++ -std=c++17 -O2 -o udp_csv udp_sender_example.cpp -lgpiod
  *
  * Executar:
- *   ./udp_csv <IP_dashboard> <porta_dashboard> [porta_local_escuta]
- *
- * Exemplo:
- *   ./udp_csv 192.168.1.100 12345 12346
+ * sudo SCCA_USE_GPIO=1 ./udp_csv <IP_dashboard> <porta_dashboard> [porta_local_escuta]
  */
 
 #include <arpa/inet.h>
@@ -92,104 +89,129 @@ static HardwareConfig read_hardware_config_from_env() {
 class GpioInputReader {
 public:
     GpioInputReader() = default;
-
-    ~GpioInputReader() {
-        close();
-    }
+    ~GpioInputReader() { close(); }
 
     bool init(const HardwareConfig& cfg) {
         close();
-
         cfg_ = cfg;
         if (cfg_.hx711_gain_pulses < 1 || cfg_.hx711_gain_pulses > 3) {
             cfg_.hx711_gain_pulses = 1;
         }
 
-        chip_ = gpiod_chip_open("/dev/gpiochip0");
+        // Abrindo o chip correto da Raspberry Pi 5
+        chip_ = gpiod_chip_open("/dev/gpiochip4");
         if (!chip_) {
-            std::perror("gpiod_chip_open");
+            std::perror("gpiod_chip_open (/dev/gpiochip4)");
             return false;
         }
 
-        if (!request_input_line(cfg_.beep_trim_up_pin, beep_up_line_, "scca_beep_up")) return false;
-        if (!request_input_line(cfg_.beep_trim_down_pin, beep_down_line_, "scca_beep_down")) return false;
-        if (!request_input_line(cfg_.trim_release_pin, trim_release_line_, "scca_trim_release")) return false;
-        if (!request_input_line(cfg_.override_pin, override_line_, "scca_override")) return false;
-        if (!request_input_line(cfg_.hx711_dout_pin, hx711_dout_line_, "scca_hx711_dout")) return false;
-        if (!request_output_line(cfg_.hx711_sck_pin, hx711_sck_line_, "scca_hx711_sck")) return false;
+        // --- Configuração das Entradas Digitais (Botoes) com PULL-UP ATIVO ---
+        gpiod_line_settings* settings_in = gpiod_line_settings_new();
+        gpiod_line_settings_set_direction(settings_in, GPIOD_LINE_DIRECTION_INPUT);
+        gpiod_line_settings_set_bias(settings_in, GPIOD_LINE_BIAS_PULL_UP); // <--- FORÇA O PINO PARA 3.3V SE SOLTO
+
+        gpiod_line_config* line_cfg_in = gpiod_line_config_new();
+        unsigned int input_offsets[] = {
+            static_cast<unsigned int>(cfg_.beep_trim_up_pin),
+            static_cast<unsigned int>(cfg_.beep_trim_down_pin),
+            static_cast<unsigned int>(cfg_.trim_release_pin),
+            static_cast<unsigned int>(cfg_.override_pin),
+            static_cast<unsigned int>(cfg_.hx711_dout_pin)
+        };
+        
+        for (unsigned int offset : input_offsets) {
+            gpiod_line_config_add_line_settings(line_cfg_in, &offset, 1, settings_in);
+        }
+
+        gpiod_request_config* req_cfg_in = gpiod_request_config_new();
+        gpiod_request_config_set_consumer(req_cfg_in, "scca_inputs");
+
+        inputs_req_ = gpiod_chip_request_lines(chip_, req_cfg_in, line_cfg_in);
+
+        gpiod_line_settings_free(settings_in);
+        gpiod_line_config_free(line_cfg_in);
+        gpiod_request_config_free(req_cfg_in);
+
+        if (!inputs_req_) {
+            std::perror("Erro ao requisitar pinos de entrada");
+            return false;
+        }
+
+        // --- Configuração da Saída (SCK) ---
+        gpiod_line_settings* settings_out = gpiod_line_settings_new();
+        gpiod_line_settings_set_direction(settings_out, GPIOD_LINE_DIRECTION_OUTPUT);
+        gpiod_line_settings_set_output_value(settings_out, GPIOD_LINE_VALUE_INACTIVE);
+
+        gpiod_line_config* line_cfg_out = gpiod_line_config_new();
+        unsigned int sck_offset = static_cast<unsigned int>(cfg_.hx711_sck_pin);
+        gpiod_line_config_add_line_settings(line_cfg_out, &sck_offset, 1, settings_out);
+
+        gpiod_request_config* req_cfg_out = gpiod_request_config_new();
+        gpiod_request_config_set_consumer(req_cfg_out, "scca_outputs");
+
+        outputs_req = gpiod_chip_request_lines(chip_, req_cfg_out, line_cfg_out);
+
+        gpiod_line_settings_free(settings_out);
+        gpiod_line_config_free(line_cfg_out);
+        gpiod_request_config_free(req_cfg_out);
+
+        if (!outputs_req) {
+            std::perror("Erro ao requisitar pino de saída SCK");
+            return false;
+        }
 
         return true;
     }
 
     void close() {
-        release_line(beep_up_line_);
-        release_line(beep_down_line_);
-        release_line(trim_release_line_);
-        release_line(override_line_);
-        release_line(hx711_dout_line_);
-        release_line(hx711_sck_line_);
-
-        if (chip_) {
-            gpiod_chip_close(chip_);
-            chip_ = nullptr;
-        }
+        if (inputs_req_) { gpiod_line_request_release(inputs_req_); inputs_req_ = nullptr; }
+        if (outputs_req) { gpiod_line_request_release(outputs_req); outputs_req = nullptr; }
+        if (chip_) { gpiod_chip_close(chip_); chip_ = nullptr; }
     }
 
     bool read_digital_states(int& beep_up, int& beep_down, int& trim_release, int& override_state) const {
-        if (!beep_up_line_ || !beep_down_line_ || !trim_release_line_ || !override_line_) {
-            return false;
-        }
+        if (!inputs_req_) return false;
 
-        beep_up = read_line_value(beep_up_line_);
-        beep_down = read_line_value(beep_down_line_);
-        trim_release = read_line_value(trim_release_line_);
-        override_state = read_line_value(override_line_);
+        beep_up = gpiod_line_request_get_value(inputs_req_, cfg_.beep_trim_up_pin);
+        beep_down = gpiod_line_request_get_value(inputs_req_, cfg_.beep_trim_down_pin);
+        trim_release = gpiod_line_request_get_value(inputs_req_, cfg_.trim_release_pin);
+        override_state = gpiod_line_request_get_value(inputs_req_, cfg_.override_pin);
 
-        if (beep_up < 0 || beep_down < 0 || trim_release < 0 || override_state < 0) {
-            return false;
-        }
+        if (beep_up < 0 || beep_down < 0 || trim_release < 0 || override_state < 0) return false;
 
-        beep_up = (beep_up != 0) ? 1 : 0;
-        beep_down = (beep_down != 0) ? 1 : 0;
-        trim_release = (trim_release != 0) ? 1 : 0;
-        override_state = (override_state != 0) ? 1 : 0;
+        // Inversão de lógica: se ler 0V (INACTIVE devido ao clique pro GND), vira 1 (Ativo no Dashboard)
+        beep_up        = (beep_up == GPIOD_LINE_VALUE_INACTIVE) ? 1 : 0;
+        beep_down      = (beep_down == GPIOD_LINE_VALUE_INACTIVE) ? 1 : 0;
+        trim_release   = (trim_release == GPIOD_LINE_VALUE_INACTIVE) ? 1 : 0;
+        override_state = (override_state == GPIOD_LINE_VALUE_INACTIVE) ? 1 : 0;
 
         return true;
     }
 
     bool read_hx711_value(int& out_value) {
-        if (!hx711_dout_line_ || !hx711_sck_line_) {
-            return false;
-        }
+        if (!inputs_req_ || !outputs_req) return false;
 
-        // Se DOUT estiver alto, o HX711 ainda nao tem dado pronto.
-        const int ready = read_line_value(hx711_dout_line_);
-        if (ready < 0 || ready != 0) {
-            return false;
-        }
+        const int ready = gpiod_line_request_get_value(inputs_req_, cfg_.hx711_dout_pin);
+        if (ready < 0 || ready != GPIOD_LINE_VALUE_INACTIVE) return false;
 
         int32_t raw = 0;
         for (int i = 0; i < 24; ++i) {
-            if (!set_sck(1)) return false;
+            if (gpiod_line_request_set_value(outputs_req, cfg_.hx711_sck_pin, GPIOD_LINE_VALUE_ACTIVE) != 0) return false;
             usleep(1);
 
-            const int bit = read_line_value(hx711_dout_line_);
+            const int bit = gpiod_line_request_get_value(inputs_req_, cfg_.hx711_dout_pin);
             if (bit < 0) return false;
-            raw = static_cast<int32_t>((raw << 1) | (bit & 0x01));
+            raw = (raw << 1) | ((bit == GPIOD_LINE_VALUE_ACTIVE) ? 1 : 0);
 
-            if (!set_sck(0)) return false;
+            if (gpiod_line_request_set_value(outputs_req, cfg_.hx711_sck_pin, GPIOD_LINE_VALUE_INACTIVE) != 0) return false;
             usleep(1);
         }
 
-        // Pulso(s) extra para selecionar ganho/canal do proximo sample.
         for (int i = 0; i < cfg_.hx711_gain_pulses; ++i) {
-            if (!set_sck(1)) return false;
-            usleep(1);
-            if (!set_sck(0)) return false;
-            usleep(1);
+            gpiod_line_request_set_value(outputs_req, cfg_.hx711_sck_pin, GPIOD_LINE_VALUE_ACTIVE); usleep(1);
+            gpiod_line_request_set_value(outputs_req, cfg_.hx711_sck_pin, GPIOD_LINE_VALUE_INACTIVE); usleep(1);
         }
 
-        // Extensao de sinal do valor 24 bits.
         if (raw & 0x00800000) {
             raw |= static_cast<int32_t>(0xFF000000);
         }
@@ -199,55 +221,10 @@ public:
     }
 
 private:
-    static void release_line(gpiod_line*& line) {
-        if (line) {
-            gpiod_line_release(line);
-            line = nullptr;
-        }
-    }
-
-    bool request_input_line(int pin, gpiod_line*& out_line, const char* consumer) {
-        out_line = gpiod_chip_get_line(chip_, pin);
-        if (!out_line) {
-            std::cerr << "Erro ao obter linha GPIO " << pin << std::endl;
-            return false;
-        }
-        if (gpiod_line_request_input(out_line, consumer) < 0) {
-            std::cerr << "Erro ao configurar GPIO " << pin << " como entrada" << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    bool request_output_line(int pin, gpiod_line*& out_line, const char* consumer) {
-        out_line = gpiod_chip_get_line(chip_, pin);
-        if (!out_line) {
-            std::cerr << "Erro ao obter linha GPIO " << pin << std::endl;
-            return false;
-        }
-        if (gpiod_line_request_output(out_line, consumer, 0) < 0) {
-            std::cerr << "Erro ao configurar GPIO " << pin << " como saida" << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    static int read_line_value(gpiod_line* line) {
-        return gpiod_line_get_value(line);
-    }
-
-    bool set_sck(int value) {
-        return gpiod_line_set_value(hx711_sck_line_, value) == 0;
-    }
-
     HardwareConfig cfg_{};
     gpiod_chip* chip_ = nullptr;
-    gpiod_line* beep_up_line_ = nullptr;
-    gpiod_line* beep_down_line_ = nullptr;
-    gpiod_line* trim_release_line_ = nullptr;
-    gpiod_line* override_line_ = nullptr;
-    gpiod_line* hx711_dout_line_ = nullptr;
-    gpiod_line* hx711_sck_line_ = nullptr;
+    gpiod_line_request* inputs_req_ = nullptr;
+    gpiod_line_request* outputs_req = nullptr;
 };
 #endif
 
@@ -427,7 +404,6 @@ int main(int argc, char* argv[]) {
     int sample_index = 0;
     int last_load_cell = 0;
 
-    // Loop de baixa latencia: 50 ms (dentro da faixa especificada 50-150 ms).
     while (true) {
         poll_dashboard_commands_non_blocking(sock, control_state);
 
@@ -451,11 +427,15 @@ int main(int argc, char* argv[]) {
                 override_state = hw_override;
             }
 
+            // --- ISOLAMENTO DE TESTE DO HX711 ---
+            // Comentado para evitar travamento síncrono caso a fiação da célula esteja solta.
+            /*
             int hw_load = 0;
             if (gpio_reader.read_hx711_value(hw_load)) {
                 last_load_cell = hw_load;
             }
-            load_cell = last_load_cell;
+            */
+            load_cell = 999; // <--- Valor estático para testar se as mensagens saem do travamento alto
 #endif
         } else {
             trim_release = control_state.autopilot_active ? 1 : 0;
