@@ -363,6 +363,7 @@ class SccaDashboard(QMainWindow):
         center_layout.setSpacing(12)
         center_layout.addWidget(telemetry_panel, 1)
         center_layout.addWidget(maneuver_panel)
+        center_layout.addWidget(udp_panel)
 
         body.addWidget(position_panel)
         body.addWidget(center_container, 1)
@@ -453,6 +454,7 @@ class SccaDashboard(QMainWindow):
 
     def _build_states_panel(self) -> QFrame:
         panel = self._panel_frame()
+        panel.setFixedWidth(280)
         layout = QVBoxLayout(panel)
 
         head = QLabel("Estados do Sistema")
@@ -499,6 +501,7 @@ class SccaDashboard(QMainWindow):
 
         raw_frame = QFrame()
         raw_frame.setObjectName("rawLoadCellFrame")
+        raw_frame.setMinimumHeight(72)
         raw_frame.setStyleSheet(
             "QFrame#rawLoadCellFrame {"
             "background-color: rgba(10, 20, 30, 170);"
