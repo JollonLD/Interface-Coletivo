@@ -46,13 +46,13 @@ class UDPReceiver(QObject):
     error_occurred = Signal(str)
     connection_status_changed = Signal(bool)
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 12345) -> None:
+    def __init__(self, host: str = "0.0.0.0", port: int = 5006) -> None:
         """
         Inicializa o receptor UDP.
 
         Args:
             host: Endereço IP para binding (padrão: 0.0.0.0 para aceitar qualquer interface)
-            port: Porta UDP para escuta (padrão: 12345)
+            port: Porta UDP para escuta (padrão: 5006)
         """
         super().__init__()
         self.host = host
@@ -205,6 +205,7 @@ class UDPReceiver(QObject):
                     "override": int(parts[4]),
                     "load_cell": int(parts[5]),
                 }
+                print(f"beep_trim_up: {result["parsed_data"]["beep_trim_up"]} | beep_trim_down: {result["parsed_data"]["beep_trim_down"]} | trim_release: {result["parsed_data"]["trim_release"]} | override: {result["parsed_data"]["override"]} | load_cell: {result["parsed_data"]["load_cell"]} \n")
                 result["parse_format"] = "csv_c"
                 return result
         except (ValueError, UnicodeDecodeError):
@@ -251,7 +252,7 @@ class MockUDPSender(QObject):
     Útil para desenvolvimento e testes sem hardware real.
     """
 
-    def __init__(self, receiver_host: str = "127.0.0.1", receiver_port: int = 12345) -> None:
+    def __init__(self, receiver_host: str = "127.0.0.1", receiver_port: int = 5006) -> None:
         super().__init__()
         self.receiver_host = receiver_host
         self.receiver_port = receiver_port
@@ -314,7 +315,7 @@ class CommandSender(QObject):
     def __init__(
         self,
         receiver_host: str = "127.0.0.1",
-        receiver_port: int = 12346,
+        receiver_port: int = 5005,
         send_interval_ms: int = 50,
     ) -> None:
         """
@@ -322,7 +323,7 @@ class CommandSender(QObject):
         
         Args:
             receiver_host: IP do Raspberry Pi (ou 127.0.0.1 para localhost)
-            receiver_port: Porta UDP no Raspberry Pi (padrão: 12346 para comandos)
+            receiver_port: Porta UDP no Raspberry Pi (padrão: 5005 para comandos)
         """
         super().__init__()
         self.receiver_host = receiver_host
@@ -495,9 +496,9 @@ class MockRaspberryAutopilot(QObject):
     def __init__(
         self,
         command_host: str = "127.0.0.1",
-        command_port: int = 12346,
+        command_port: int = 5005,
         telemetry_host: str = "127.0.0.1",
-        telemetry_port: int = 12345,
+        telemetry_port: int = 5006,
     ) -> None:
         super().__init__()
         self.command_host = command_host

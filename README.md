@@ -1,111 +1,128 @@
-# Dashboard SCCA (PySide6)
+# Interface SCCA (Dashboard + Raspberry agent)
 
-Interface grafica profissional para o **Sistema de Comando Coletivo Ativo (SCCA)**, com tema industrial/aeronautico escuro, telemetria em tempo real e simulacao de dados via thread.
+Este repositório contém a interface gráfica do Sistema de Comando Coletivo Ativo (SCCA) e o agente de telemetria em C++ para Raspberry Pi.
 
-## Requisitos implementados
+**Visão geral**
+- Dashboard: UI em Python (PySide6) responsável por exibir telemetria e enviar comandos.
+- Agente Raspberry: programa C++ que lê botões via GPIO e a célula de carga (HX711) e envia telemetria via UDP CSV.
 
-- Tema dark com destaques neon:
-  - Laranja para dados
-  - Verde para status OK
-  - Vermelho para alertas criticos
-- Monitoramento de posicao com gauge vertical (0 a 100%) e mostrador numerico grande.
-- Estados do sistema:
-  - Trim (HOLD / RELEASE)
-  - Beep Trim (UP / DOWN)
-  - Piloto Automatico (PA ACTIVE / OVERRIDE)
-  - Alerta critico "FALHA HIDRAULICA" com efeito visual de destaque.
-- Telemetria em tempo real:
-  - Mostrador circular da Forca do Piloto em KG e N
-  - Indicadores de conectividade (LEDs virtuais): UDP (Raspberry Pi) e USB (Arduino)
-- Painel de testes com botoes:
-  - Acoplar PA
-  - Gerar Movimento Aleatorio
-  - Ativar Pane Hidraulica
+**Principais mudanças recentes**
+- O código C++ foi reorganizado para `raspberry_pi/` com a estrutura `include/` + `src/` (subpastas `net/`, `gpio/`, `sensor/`).
+- A leitura do HX711 foi migrada para a biblioteca `hx711-1` (wrapper em `src/sensor/hx711_adapter.*`) e usa `isReady()` antes de `read()` (não bloqueante).
 
-## Arquitetura para integracao futura
+**Build & Execução**
 
-A aquisicao de dados esta isolada em `scca/data_worker.py`:
-
-- `BaseDataReceiver`: contrato de aquisicao
-- `MockDataReceiver`: mock atual (simulacao)
-- `DataWorkerThread`: thread de atualizacao a cada 100 ms emitindo `Signal`
-
-Para integrar com requisitos reais (RI-04 e RI-05), substitua o `MockDataReceiver` por um receiver concreto que implemente `receive_data()` via socket UDP e serial USB.
-
-## Executar
-
-1. Instale dependencias:
+Dashboard (Python)
+- Instalar dependências:
 
 ```bash
 pip install -r requirements.txt
 ```
-
-2. Rode o dashboard:
+- Executar:
 
 ```bash
 python main.py
 ```
 
-## Teste fim a fim sem Raspberry
-
-Para validar localmente o protocolo UDP CSV completo (Dashboard <-> Raspberry simulado), execute:
-
-```bash
-./scripts/run_full_udp_sim_test.sh
-```
-
-Esse comando:
-- compila `raspberry_pi/udp_sender_example.cpp` em `/tmp/udp_csv_test`
-- sobe um teste automatizado que simula a interface enviando pacotes `P,...`
-- valida recebimento de pacotes `C,...` e imprime resumo (sucesso/falha)
-
-Opcoes uteis:
+Agente Raspberry (C++)
+- Entre em `raspberry_pi/` e rode:
 
 ```bash
-./scripts/run_full_udp_sim_test.sh --duration 10 --interval-ms 100
+cd raspberry_pi
+make
 ```
 
-## Modo ao vivo (interface + simulador local)
-
-Para abrir a interface e manter o simulador do Raspberry rodando em paralelo:
+- Isso compila o agente e gera o executável `udp_csv` no diretório `raspberry_pi`.
+- Para instalar no sistema (sudo):
 
 ```bash
-./scripts/run_live_udp_dashboard.sh
+make install
 ```
 
-Em outro terminal, acompanhe os pacotes em tempo real:
+Executar o agente:
 
 ```bash
-tail -f .logs/udp_simulator.log
+./udp_csv <IP_dashboard> <porta_dashboard> [porta_local_escuta]
 ```
 
-Voce deve ver linhas como:
-- `TX C: C,...` (telemetria enviada para o dashboard)
-- `RX P: autopilot=...` (controle recebido do dashboard)
-
-Observacao:
-- Nao e travamento: tanto o dashboard quanto o simulador sao processos continuos.
-- O script encerra o simulador automaticamente quando voce fecha a janela do dashboard.
-
-## Simular dados variando do Raspberry (telemetria C)
-
-Se quiser apenas simular o envio de telemetria do Raspberry para confirmar animacao do dashboard:
+Exemplo:
 
 ```bash
-./scripts/run_dashboard_with_fake_raspberry.sh
+./udp_csv 192.168.1.100 12345 12346
 ```
 
-Esse modo usa `scripts/simulate_raspberry_telemetry.py` para enviar pacotes `C,...` com valores variando em tempo real.
+**Estrutura do repositório (relevante)**
+- `main.py` — entrada da aplicação Python (Dashboard).
+- `raspberry_pi/` — código do agente C++ e Makefile.
+	- `raspberry_pi/include/telemetry.hpp` — tipos e helpers CSV (namespace `scca`).
+	- `raspberry_pi/src/main.cpp` — entrypoint do agente.
+	- `raspberry_pi/src/net/udp_comm.*` — socket UDP não-bloqueante.
+	- `raspberry_pi/src/gpio/gpio_input_reader.*` — leitura de botões (libgpiod).
+	- `raspberry_pi/src/sensor/hx711_adapter.*` — wrapper para `hx711-1`.
+	- `raspberry_pi/Makefile` — build e targets úteis (all/clean/install/run).
 
-Para ver os pacotes enviados:
+**Variáveis de ambiente (configuração de hardware)**
+- `SCCA_USE_GPIO` — `1` para habilitar GPIO real (caso contrário, modo simulado).
+- GPIO pins: `SCCA_GPIO_BEEP_UP`, `SCCA_GPIO_BEEP_DOWN`, `SCCA_GPIO_TRIM_RELEASE`, `SCCA_GPIO_OVERRIDE`.
+- HX711: `SCCA_GPIO_HX711_DOUT`, `SCCA_GPIO_HX711_SCK`, `SCCA_GPIO_HX711_GAIN_PULSES`.
+
+Exemplo:
 
 ```bash
-tail -f .logs/fake_raspberry.log
+export SCCA_USE_GPIO=1
+export SCCA_GPIO_BEEP_UP=17
+export SCCA_GPIO_BEEP_DOWN=27
+export SCCA_GPIO_HX711_DOUT=5
+export SCCA_GPIO_HX711_SCK=6
+./udp_csv 192.168.1.100 12345
 ```
 
-## Estrutura
+**Dependências de sistema (Raspberry Pi)**
+- `libgpiod-dev` — para acesso a GPIO via libgpiod.
+- `libhx711` — a biblioteca `hx711-1` (há um subdiretório `hx711/` no repositório; execute `cd hx711 && make && sudo make install` para instalar quando necessário).
 
-- `main.py`: ponto de entrada
-- `scca/dashboard.py`: UI principal e widgets customizados
-- `scca/data_worker.py`: thread de dados + mock
-- `scca/styles.py`: QSS central do painel
+Instalação de exemplo:
+
+```bash
+sudo apt update
+sudo apt install build-essential libgpiod-dev git unzip wget
+# Opcional: instalar lgpio e hx711 via scripts abaixo
+```
+
+Instalação automática (lgpio + hx711)
+
+Dentro de `raspberry_pi/` existe um script que compila e instala `lgpio` e `hx711` localmente:
+
+```bash
+cd raspberry_pi
+bash scripts/install_libs.sh
+```
+
+O script executa (equivalente a):
+
+lgpio:
+
+```bash
+wget http://abyz.me.uk/lg/lg.zip
+unzip lg.zip
+cd lg
+make
+sudo make install
+```
+
+hx711:
+
+```bash
+git clone https://github.com/endail/hx711
+cd hx711
+make && sudo make install
+```
+
+**Logs / Debug**
+- O agente C++ imprime `TX C: ...` quando envia telemetria e `RX P: ...` quando recebe comandos. Use esse log para depuração.
+
+**Testes e simulação**
+- Você pode rodar o dashboard em modo simulado (sem Raspberry) e usar scripts de test para enviar pacotes UDP. Se desejar, eu adiciono scripts de simulação atualizados ou um README específico em `raspberry_pi/` com exemplos step-by-step.
+
+---
+Se quiser, atualizo também um README interno em `raspberry_pi/` com exemplos de deploy (scp/ssh) e um target `deploy` no `Makefile`.
