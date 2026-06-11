@@ -4,9 +4,10 @@ import json
 import logging
 import math
 import os
+import struct
 import time
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -154,6 +155,142 @@ class CircularForceGauge(QWidget):
             painter.drawText(int(tx) - 10, int(ty) + 5, label)
 
 
+class LinuxJoystickReader(QObject):
+    """Leitura local do joystick do Linux usado para a posição do coletivo."""
+
+    position_changed = Signal(float)
+    connection_changed = Signal(bool)
+    error_occurred = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.device_path = os.getenv("SCCA_JOYSTICK_DEVICE", "/dev/input/js0")
+        axis_env = os.getenv("SCCA_JOYSTICK_AXIS", "")
+        self.axis_number = int(axis_env) if axis_env.strip().isdigit() else None
+        self.invert_axis = os.getenv("SCCA_JOYSTICK_INVERT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.min_raw = int(os.getenv("SCCA_JOYSTICK_MIN_RAW", "32767"))
+        self.max_raw = int(os.getenv("SCCA_JOYSTICK_MAX_RAW", "-32767"))
+        self.smoothing_alpha = float(os.getenv("SCCA_JOYSTICK_SMOOTHING_ALPHA", "0.18"))
+        self.deadband_percent = float(os.getenv("SCCA_JOYSTICK_DEADBAND_PERCENT", "0.25"))
+        self.smoothing_alpha = max(0.01, min(1.0, self.smoothing_alpha))
+        self.deadband_percent = max(0.0, min(5.0, self.deadband_percent))
+        self._fd: int | None = None
+        self._connected = False
+        self._position_percent = 0.0
+        self._filtered_position_percent = 0.0
+        self._has_filtered_position = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll_device)
+
+    @property
+    def position_percent(self) -> float:
+        return self._position_percent
+
+    def start(self, poll_interval_ms: int = 20) -> None:
+        self._timer.start(max(10, poll_interval_ms))
+        self._poll_device()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self._close_device()
+
+    def _set_connected(self, connected: bool) -> None:
+        if self._connected != connected:
+            self._connected = connected
+            self.connection_changed.emit(connected)
+
+    def _close_device(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        self._set_connected(False)
+
+    def _open_device(self) -> bool:
+        if self._fd is not None:
+            return True
+
+        try:
+            self._fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
+            self._set_connected(True)
+            return True
+        except FileNotFoundError:
+            self._set_connected(False)
+            return False
+        except PermissionError as exc:
+            self._close_device()
+            self.error_occurred.emit(f"Sem permissão para ler {self.device_path}: {exc}")
+            return False
+        except OSError as exc:
+            self._close_device()
+            self.error_occurred.emit(f"Falha ao abrir {self.device_path}: {exc}")
+            return False
+
+    def _raw_to_percent(self, raw_value: int) -> float:
+        low = self.min_raw
+        high = self.max_raw
+        if high == low:
+            return 0.0
+
+        if low > high:
+            low, high = high, low
+
+        clipped = max(low, min(high, raw_value))
+        percent = ((clipped - high) / (low - high)) * 100.0
+        if self.invert_axis:
+            percent = 100.0 - percent
+        return max(0.0, min(100.0, percent))
+
+    def _smooth_position(self, new_position: float) -> float:
+        if not self._has_filtered_position:
+            self._filtered_position_percent = new_position
+            self._has_filtered_position = True
+            return new_position
+
+        delta = new_position - self._filtered_position_percent
+        if abs(delta) <= self.deadband_percent:
+            return self._filtered_position_percent
+
+        self._filtered_position_percent += delta * self.smoothing_alpha
+        return self._filtered_position_percent
+
+    def _poll_device(self) -> None:
+        if not self._open_device() or self._fd is None:
+            return
+
+        while True:
+            try:
+                chunk = os.read(self._fd, 8)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                self.error_occurred.emit(f"Erro ao ler joystick em {self.device_path}: {exc}")
+                self._close_device()
+                return
+
+            if len(chunk) < 8:
+                break
+
+            _event_time, value, event_type, number = struct.unpack("<IhBB", chunk)
+            event_kind = event_type & 0x7F
+            if event_kind != 0x02:
+                continue
+
+            if self.axis_number is None:
+                self.axis_number = number
+
+            if number != self.axis_number:
+                continue
+
+            new_position = self._raw_to_percent(value)
+            smoothed_position = self._smooth_position(new_position)
+            if abs(smoothed_position - self._position_percent) >= 0.05:
+                self._position_percent = smoothed_position
+                self.position_changed.emit(smoothed_position)
+
+
 class SccaDashboard(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -161,7 +298,7 @@ class SccaDashboard(QMainWindow):
         self.resize(1300, 760)
 
         # Inicializar UDP Receiver (recebe telemetria do Raspberry Pi)
-        self.udp_receiver = UDPReceiver(host="0.0.0.0", port=12345)
+        self.udp_receiver = UDPReceiver(host="0.0.0.0", port=5006)
         self.udp_receiver.packet_received.connect(self._on_udp_packet_received)
         self.udp_receiver.error_occurred.connect(self._on_udp_error)
         self.udp_receiver.connection_status_changed.connect(self._on_udp_connection_changed)
@@ -169,11 +306,11 @@ class SccaDashboard(QMainWindow):
         # Inicializar Command Sender (envia manobras para Raspberry Pi)
         initial_host = os.getenv("SCCA_COMMAND_HOST", "127.0.0.1")
         try:
-            initial_port = int(os.getenv("SCCA_COMMAND_PORT", "12346"))
+            initial_port = int(os.getenv("SCCA_COMMAND_PORT", "5005"))
         except ValueError:
-            initial_port = 12346
+            initial_port = 5005
             self.logger = logging.getLogger("Dashboard")
-            self.logger.warning("SCCA_COMMAND_PORT inválida; usando 12346")
+            self.logger.warning("SCCA_COMMAND_PORT inválida; usando 5005")
         try:
             initial_interval_ms = int(os.getenv("SCCA_COMMAND_INTERVAL_MS", "50"))
         except ValueError:
@@ -193,7 +330,7 @@ class SccaDashboard(QMainWindow):
             command_host="127.0.0.1",
             command_port=initial_port,
             telemetry_host="127.0.0.1",
-            telemetry_port=12345,
+            telemetry_port=5006,
         )
         self.mock_raspberry.status_changed.connect(self._on_mock_status_changed)
         self.mock_raspberry.error_occurred.connect(self._on_mock_error)
@@ -226,11 +363,15 @@ class SccaDashboard(QMainWindow):
         center_layout.setSpacing(12)
         center_layout.addWidget(telemetry_panel, 1)
         center_layout.addWidget(maneuver_panel)
-        center_layout.addWidget(udp_panel)
 
         body.addWidget(position_panel)
         body.addWidget(center_container, 1)
         body.addWidget(states_panel)
+
+        self.joystick_reader = LinuxJoystickReader()
+        self.joystick_reader.position_changed.connect(self._on_joystick_position_changed)
+        self.joystick_reader.connection_changed.connect(self._on_joystick_connection_changed)
+        self.joystick_reader.error_occurred.connect(self._on_joystick_error)
 
         self.flash_timer = QTimer(self)
         self.flash_timer.setInterval(300)
@@ -253,6 +394,7 @@ class SccaDashboard(QMainWindow):
 
         # Iniciar servidor UDP
         self.udp_receiver.start()
+        self.joystick_reader.start()
         self.command_sender.start_stream()
         self.control_timer.start()
 
@@ -268,7 +410,7 @@ class SccaDashboard(QMainWindow):
         panel.setFixedWidth(260)
         layout = QVBoxLayout(panel)
 
-        head = QLabel("Monitoramento de Posicao")
+        head = QLabel("Monitoramento de Posicao (Joystick)")
         head.setObjectName("subtitle")
         layout.addWidget(head)
 
@@ -288,6 +430,19 @@ class SccaDashboard(QMainWindow):
         row.addWidget(self.position_bar)
         row.addWidget(self.position_display, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addLayout(row, 1)
+
+        status_row = QHBoxLayout()
+        status_label = QLabel("Entrada local")
+        status_label.setObjectName("subtitle")
+        self.joystick_led = LedIndicator("#16ff9a", "#3b4754")
+        self.joystick_status = QLabel("Aguardando joystick do Arduino")
+        self.joystick_status.setObjectName("subtitle")
+        self.joystick_status.setStyleSheet("color: #82d8ff; font-size: 10px;")
+        status_row.addWidget(status_label)
+        status_row.addWidget(self.joystick_led)
+        status_row.addWidget(self.joystick_status)
+        status_row.addStretch(1)
+        layout.addLayout(status_row)
         return panel
 
     def _state_label(self, text: str, state: str = "off") -> QLabel:
@@ -310,7 +465,7 @@ class SccaDashboard(QMainWindow):
         self.beep_up_lbl = self._state_label("Beep Trim: UP", "off")
         self.beep_down_lbl = self._state_label("Beep Trim: DOWN", "off")
 
-        self.pa_active_lbl = self._state_label("PA: ACTIVE", "ok")
+        self.pa_active_lbl = self._state_label("PA: ACTIVE", "off")
         self.pa_override_lbl = self._state_label("PA: OVERRIDE", "off")
 
         self.alert_lbl = QLabel("ALERTA CRITICO: FALHA HIDRAULICA")
@@ -341,6 +496,31 @@ class SccaDashboard(QMainWindow):
         self.force_gauge = CircularForceGauge()
         self.force_gauge.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.force_gauge, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        raw_frame = QFrame()
+        raw_frame.setObjectName("rawLoadCellFrame")
+        raw_frame.setStyleSheet(
+            "QFrame#rawLoadCellFrame {"
+            "background-color: rgba(10, 20, 30, 170);"
+            "border: 1px solid #3b4f63;"
+            "border-radius: 8px;"
+            "padding: 8px;"
+            "}"
+        )
+        raw_layout = QVBoxLayout(raw_frame)
+        raw_layout.setContentsMargins(10, 8, 10, 8)
+        raw_layout.setSpacing(2)
+
+        raw_title = QLabel("Célula de carga bruta")
+        raw_title.setObjectName("subtitle")
+        self.raw_load_cell_value = QLabel("--")
+        self.raw_load_cell_value.setObjectName("displayValue")
+        self.raw_load_cell_value.setStyleSheet("font-size: 26px; color: #82d8ff;")
+        self.raw_load_cell_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        raw_layout.addWidget(raw_title, alignment=Qt.AlignmentFlag.AlignCenter)
+        raw_layout.addWidget(self.raw_load_cell_value)
+        layout.addWidget(raw_frame)
 
         conn_row = QHBoxLayout()
         udp_label = QLabel("UDP (Raspberry Pi)")
@@ -452,7 +632,7 @@ class SccaDashboard(QMainWindow):
         layout.addWidget(self.udp_data_info)
 
         self.udp_endpoints_info = QLabel(
-            f"Escutando telemetria em 0.0.0.0:12345 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
+            f"Escutando telemetria em 0.0.0.0:5006 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
         )
         self.udp_endpoints_info.setObjectName("subtitle")
         self.udp_endpoints_info.setStyleSheet("color: #9db3c9; font-size: 10px;")
@@ -595,11 +775,12 @@ class SccaDashboard(QMainWindow):
             except (TypeError, ValueError):
                 return default
 
+        raw_load_cell = parsed.get("load_cell")
+
         if all(k in parsed for k in ("beep_trim_up", "beep_trim_down", "trim_release", "override", "load_cell")):
             beep_up = int(parsed.get("beep_trim_up", 0))
             beep_down = int(parsed.get("beep_trim_down", 0))
             trim_release = int(parsed.get("trim_release", 0))
-            override = int(parsed.get("override", 0))
             load_cell = int(parsed.get("load_cell", 0))
 
             if beep_up:
@@ -609,14 +790,14 @@ class SccaDashboard(QMainWindow):
             else:
                 beep_trim = "NEUTRAL"
 
-            position_proxy = max(0.0, min(100.0, (to_float(load_cell, 0.0) / 1023.0) * 100.0))
+            pilot_force_kg = max(0.0, to_float(load_cell, 0.0) / 10.0)
             return {
-                "position_percent": position_proxy,
                 "trim_hold": trim_release == 0,
                 "beep_trim": beep_trim,
-                "pa_active": override == 0,
+                "pa_active": any(btn.isChecked() for btn in self.maneuver_buttons.values()),
                 "hydraulic_failure": bool(self.pane_tile.isChecked()),
-                "pilot_force_kg": max(0.0, to_float(load_cell, 0.0) / 10.0),
+                "raw_load_cell": raw_load_cell,
+                "pilot_force_kg": pilot_force_kg,
                 "udp_connected": True,
                 "usb_connected": True,
                 "selected_maneuver": next((n for n, b in self.maneuver_buttons.items() if b.isChecked()), "Manobra 1"),
@@ -629,8 +810,8 @@ class SccaDashboard(QMainWindow):
 
     def _apply_dashboard_telemetry(self, data: dict, source: str) -> None:
         """Atualiza os widgets principais com a telemetria recebida."""
-        self.position_bar.setValue(int(max(0.0, min(100.0, data["position_percent"])) * 10))
-        self.position_display.setText(f"{data['position_percent']:.1f}%")
+        raw_load_cell = data.get("raw_load_cell")
+        self.raw_load_cell_value.setText("--" if raw_load_cell is None else str(raw_load_cell))
         self.force_gauge.set_force_kg(data["pilot_force_kg"])
 
         trim_hold = data["trim_hold"]
@@ -641,7 +822,7 @@ class SccaDashboard(QMainWindow):
         self._set_state(self.beep_up_lbl, "ok" if beep_trim == "UP" else "off")
         self._set_state(self.beep_down_lbl, "ok" if beep_trim == "DOWN" else "off")
 
-        pa_active = data["pa_active"]
+        pa_active = any(btn.isChecked() for btn in self.maneuver_buttons.values())
         self._set_state(self.pa_active_lbl, "ok" if pa_active else "off")
         self._set_state(self.pa_override_lbl, "ok" if not pa_active else "off")
 
@@ -694,6 +875,21 @@ class SccaDashboard(QMainWindow):
         state_text = state_text_map.get(state_raw, state_raw)
         self.maneuver_hint.setText(f"{selected} | Status: {state_text}")
 
+    def _on_joystick_position_changed(self, position_percent: float) -> None:
+        self.position_bar.setValue(int(max(0.0, min(100.0, position_percent)) * 10))
+        self.position_display.setText(f"{position_percent:.1f}%")
+
+    def _on_joystick_connection_changed(self, connected: bool) -> None:
+        self.joystick_led.set_on(connected)
+        if connected:
+            self.joystick_status.setText(f"{self.joystick_reader.device_path} ativo")
+        else:
+            self.joystick_status.setText("Aguardando joystick do Arduino")
+
+    def _on_joystick_error(self, error_msg: str) -> None:
+        self.logger.warning(f"Joystick: {error_msg}")
+        self.joystick_status.setText("Falha ao ler joystick")
+
     def _on_udp_packet_received(self, packet_dict: dict) -> None:
         """Handler para pacotes UDP recebidos do Raspberry Pi."""
         self._udp_packet_num = getattr(self, "_udp_packet_num", 0) + 1
@@ -714,7 +910,7 @@ class SccaDashboard(QMainWindow):
             self.command_sender.set_target(receiver_host=self._command_target_host, receiver_port=self._command_target_port)
             self.logger.info(f"Destino de comandos ajustado para {self._command_target_host}:{self._command_target_port}")
             self.udp_endpoints_info.setText(
-                f"Escutando telemetria em 0.0.0.0:12345 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
+                f"Escutando telemetria em 0.0.0.0:5006 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
             )
 
         self.udp_data_info.setText(
@@ -744,7 +940,7 @@ class SccaDashboard(QMainWindow):
         """Handler para mudanças no status de conexão UDP."""
         self.udp_status_led.set_on(connected)
         if connected:
-            self.udp_data_info.setText("Servidor UDP ativo - aguardando dados do Raspberry Pi...")
+            self.udp_data_info.setText("Servidor UDP ativo - aguardando dados do Raspberry Pi em 5006...")
         else:
             self.udp_data_info.setText("Servidor UDP desconectado")
 
@@ -763,6 +959,7 @@ class SccaDashboard(QMainWindow):
         self.maneuver_hint.setText(f"Erro ao enviar: {error_msg}")
 
     def closeEvent(self, event) -> None:
+        self.joystick_reader.stop()
         self.mock_raspberry.stop()
         if self.control_timer.isActive():
             self.control_timer.stop()
