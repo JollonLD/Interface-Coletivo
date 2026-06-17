@@ -47,8 +47,11 @@ constexpr int OVERRIDE_STOPPED_LIMIT = 30000;
 constexpr int OVERRIDE_UP_LIMIT      = 180000;
 constexpr int OVERRIDE_DOWN_LIMIT    = -180000;
 
-// Margem de segurança para área útil calibrada (evita acionar fins de curso)
-constexpr int CALIBRATION_MARGIN = 20000;
+// Margem de segurança em hxNet antes dos batentes físicos (aprendidos na calibragem)
+constexpr int32_t LIMIT_SAFETY_MARGIN_HX = 25000;
+
+// Passos de recuo após tocar o fim de curso durante operação
+constexpr int LIMIT_BACKOFF_STEPS = 40;
 
 // IDs de manobra recebidos via UDP (pacote P)
 constexpr int MANEUVER_NONE              = 0;
@@ -83,6 +86,10 @@ std::atomic<int32_t> g_hxCalMin(0);
 std::atomic<int32_t> g_hxCalMax(0);
 std::atomic<int> g_hxCalibrated(0);
 
+// hxNet registrado quando cada batente físico foi detectado
+std::atomic<int32_t> g_hxAtLimitBottom(0);
+std::atomic<int32_t> g_hxAtLimitTop(0);
+
 // Direção do movimento constante do PA: 1 = UP, -1 = DOWN
 std::atomic<int> g_paDirection(-1);
 
@@ -116,20 +123,120 @@ void updateOverride()
     g_override = overrideValue;
 }
 
-// Define a área útil com margem de segurança em relação aos limites de override.
-void autoCalibrateTransducerUsefulArea()
+// Limites teóricos de fallback quando os batentes ainda não foram calibrados.
+void setFallbackUsefulArea()
 {
-    g_hxCalMin = OVERRIDE_DOWN_LIMIT + CALIBRATION_MARGIN;
-    g_hxCalMax = OVERRIDE_UP_LIMIT - CALIBRATION_MARGIN;
+    g_hxCalMin = OVERRIDE_DOWN_LIMIT + LIMIT_SAFETY_MARGIN_HX;
+    g_hxCalMax = OVERRIDE_UP_LIMIT - LIMIT_SAFETY_MARGIN_HX;
+    g_hxCalibrated = 1;
+}
+
+void updateSafeAreaFromLearnedLimits()
+{
+    int32_t hxBottom = g_hxAtLimitBottom.load();
+    int32_t hxTop = g_hxAtLimitTop.load();
+
+    if (hxBottom == 0 || hxTop == 0 || hxTop <= hxBottom)
+        return;
+
+    int32_t safeMin = hxBottom + LIMIT_SAFETY_MARGIN_HX;
+    int32_t safeMax = hxTop - LIMIT_SAFETY_MARGIN_HX;
+
+    if (safeMax <= safeMin)
+        return;
+
+    g_hxCalMin = safeMin;
+    g_hxCalMax = safeMax;
     g_hxCalibrated = 1;
 
     std::cout
-        << "Calibragem automatica: area util hxNet ["
-        << g_hxCalMin.load()
+        << "Area segura atualizada: hxNet ["
+        << safeMin
         << ", "
-        << g_hxCalMax.load()
-        << "]"
+        << safeMax
+        << "] (margem "
+        << LIMIT_SAFETY_MARGIN_HX
+        << " antes dos batentes)"
         << std::endl;
+}
+
+bool isLimitTopTriggered(gpiod::line_request& request)
+{
+    return request.get_value(LIMIT_TOP) == gpiod::line::value::INACTIVE;
+}
+
+bool isLimitBottomTriggered(gpiod::line_request& request)
+{
+    return request.get_value(LIMIT_BOTTOM) == gpiod::line::value::INACTIVE;
+}
+
+// Um passo de motor sem checagem (somente calibragem/recuo).
+bool stepMotorRaw(gpiod::line_request& request, bool direction)
+{
+    request.set_value(
+        MOTOR_DIR,
+        direction ? gpiod::line::value::ACTIVE
+                  : gpiod::line::value::INACTIVE
+    );
+
+    request.set_value(MOTOR_PUL, gpiod::line::value::ACTIVE);
+    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
+
+    request.set_value(MOTOR_PUL, gpiod::line::value::INACTIVE);
+    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
+
+    return true;
+}
+
+void backoffFromLimit(gpiod::line_request& request, bool hitTopLimit)
+{
+    // hitTopLimit: recua para baixo; caso contrário recua para cima.
+    bool backoffDirection = hitTopLimit;
+    for (int i = 0; i < LIMIT_BACKOFF_STEPS && running; i++)
+    {
+        if (hitTopLimit && !isLimitTopTriggered(request))
+            break;
+        if (!hitTopLimit && !isLimitBottomTriggered(request))
+            break;
+
+        stepMotorRaw(request, backoffDirection);
+    }
+}
+
+void registerLimitContact(bool isTopLimit)
+{
+    int32_t hxNet = g_hxNet.load();
+
+    if (isTopLimit)
+        g_hxAtLimitTop = hxNet;
+    else
+        g_hxAtLimitBottom = hxNet;
+
+    updateSafeAreaFromLearnedLimits();
+}
+
+// Verifica se o movimento é permitido antes de acionar o batente físico.
+bool canMoveDirection(gpiod::line_request& request, bool direction, int32_t hxNet)
+{
+    // direction=false -> UP; direction=true -> DOWN
+    if (!direction)
+    {
+        if (isLimitTopTriggered(request))
+            return false;
+
+        if (g_hxCalibrated.load() && hxNet >= g_hxCalMax.load())
+            return false;
+    }
+    else
+    {
+        if (isLimitBottomTriggered(request))
+            return false;
+
+        if (g_hxCalibrated.load() && hxNet <= g_hxCalMin.load())
+            return false;
+    }
+
+    return true;
 }
 
 void resetPaManeuverState()
@@ -437,45 +544,12 @@ void udpThread()
 
 bool stepMotor(gpiod::line_request& request, bool direction)
 {
-    bool limitTop = (request.get_value(LIMIT_TOP) == gpiod::line::value::INACTIVE);
-    bool limitBottom = (request.get_value(LIMIT_BOTTOM) == gpiod::line::value::INACTIVE);
+    int32_t hxNet = g_hxNet.load();
 
-    if (!direction && limitBottom)
+    if (!canMoveDirection(request, direction, hxNet))
         return false;
 
-    if (direction && limitTop)
-        return false;
-
-    request.set_value(
-        MOTOR_DIR,
-        direction ? gpiod::line::value::ACTIVE
-                  : gpiod::line::value::INACTIVE
-    );
-
-    request.set_value(MOTOR_PUL, gpiod::line::value::ACTIVE);
-    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
-
-    request.set_value(MOTOR_PUL, gpiod::line::value::INACTIVE);
-    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
-
-    return true;
-}
-
-// Movimento do motor sem verificar fins de curso físicos (usado pelo PA).
-bool stepMotorWithoutLimits(gpiod::line_request& request, bool direction)
-{
-    request.set_value(
-        MOTOR_DIR,
-        direction ? gpiod::line::value::ACTIVE
-                  : gpiod::line::value::INACTIVE
-    );
-
-    request.set_value(MOTOR_PUL, gpiod::line::value::ACTIVE);
-    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
-
-    request.set_value(MOTOR_PUL, gpiod::line::value::INACTIVE);
-    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
-
+    stepMotorRaw(request, direction);
     return true;
 }
 
@@ -494,16 +568,16 @@ bool runPaConstantMovementManeuver(gpiod::line_request& request, bool trimHold)
         return false;
 
     if (!g_hxCalibrated.load())
-        autoCalibrateTransducerUsefulArea();
+        setFallbackUsefulArea();
 
     int32_t hxNet = g_hxNet.load();
     int32_t hxMin = g_hxCalMin.load();
     int32_t hxMax = g_hxCalMax.load();
     int direction = g_paDirection.load();
 
-    if (direction == 1 && hxNet >= hxMax)
+    if (direction == 1 && (!canMoveDirection(request, false, hxNet) || hxNet >= hxMax))
         direction = -1;
-    else if (direction == -1 && hxNet <= hxMin)
+    else if (direction == -1 && (!canMoveDirection(request, true, hxNet) || hxNet <= hxMin))
         direction = 1;
 
     g_paDirection = direction;
@@ -514,7 +588,7 @@ bool runPaConstantMovementManeuver(gpiod::line_request& request, bool trimHold)
 
     if (direction == 1)
     {
-        if (hxNet >= hxMax)
+        if (!canMoveDirection(request, false, hxNet))
         {
             g_up = false;
             g_down = false;
@@ -525,12 +599,12 @@ bool runPaConstantMovementManeuver(gpiod::line_request& request, bool trimHold)
 
         g_up = true;
         g_down = false;
-        stepMotorWithoutLimits(request, false);
+        stepMotor(request, false);
         g_movement = 1;
     }
     else
     {
-        if (hxNet <= hxMin)
+        if (!canMoveDirection(request, true, hxNet))
         {
             g_up = false;
             g_down = false;
@@ -541,7 +615,7 @@ bool runPaConstantMovementManeuver(gpiod::line_request& request, bool trimHold)
 
         g_up = false;
         g_down = true;
-        stepMotorWithoutLimits(request, true);
+        stepMotor(request, true);
         g_movement = -1;
     }
 
@@ -595,7 +669,10 @@ int main()
 
     request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
 
-    autoCalibrateTransducerUsefulArea();
+    setFallbackUsefulArea();
+
+    bool prevLimitTop = false;
+    bool prevLimitBottom = false;
 
     while (running)
     {
@@ -603,12 +680,25 @@ int main()
         bool down = buttonPressed(request, BTN_DOWN);
         bool trimRelease = buttonPressed(request, BTN_TRIM_RELEASE);
 
-        //leitura dos fins de curso mantidas apenas para telemetria/log
-        bool limitTop = buttonPressed(request, LIMIT_TOP);
-        bool limitBottom = buttonPressed(request, LIMIT_BOTTOM);
+        bool limitTop = isLimitTopTriggered(request);
+        bool limitBottom = isLimitBottomTriggered(request);
 
         g_limitTop = limitTop;
         g_limitBottom = limitBottom;
+
+        if (limitTop && !prevLimitTop)
+        {
+            registerLimitContact(true);
+            backoffFromLimit(request, true);
+        }
+        else if (limitBottom && !prevLimitBottom)
+        {
+            registerLimitContact(false);
+            backoffFromLimit(request, false);
+        }
+
+        prevLimitTop = limitTop;
+        prevLimitBottom = limitBottom;
 
         bool trimHold = trimRelease;
         bool paRunning = runPaConstantMovementManeuver(request, trimHold);
@@ -675,7 +765,7 @@ int main()
                         << " HYD:" << g_hydraulicFailure.load()
                         << " POS:" << g_transducerPosition.load()
                         << (stepped ? " | UP movimentando                 "
-                                    : " | UP bloqueado: fim de curso INF  ")
+                                    : " | UP bloqueado: limite seguro     ")
                         << std::flush;
                 }
                 else if (down && !up)
@@ -700,7 +790,7 @@ int main()
                         << " HYD:" << g_hydraulicFailure.load()
                         << " POS:" << g_transducerPosition.load()
                         << (stepped ? " | DOWN movimentando               "
-                                    : " | DOWN bloqueado: fim de curso SUP")
+                                    : " | DOWN bloqueado: limite seguro   ")
                         << std::flush;
                 }
                 else
