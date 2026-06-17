@@ -351,8 +351,17 @@ void udpThread()
     close(sock);
 }
 
-void stepMotor(gpiod::line_request& request, bool direction)
+bool stepMotor(gpiod::line_request& request, bool direction)
 {
+    bool limitTop = (request.get_value(LIMIT_TOP) == gpiod::line::value::INACTIVE);
+    bool limitBottom = (request.get_value(LIMIT_BOTTOM) == gpiod::line::value::INACTIVE);
+
+    if (!direction && limitBottom)
+        return false;
+
+    if (direction && limitTop)
+        return false;
+
     request.set_value(
         MOTOR_DIR,
         direction ? gpiod::line::value::ACTIVE
@@ -364,6 +373,8 @@ void stepMotor(gpiod::line_request& request, bool direction)
 
     request.set_value(MOTOR_PUL, gpiod::line::value::INACTIVE);
     std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
+
+    return true;
 }
 
 int main()
@@ -414,6 +425,7 @@ int main()
         bool down = buttonPressed(request, BTN_DOWN);
         bool trimRelease = buttonPressed(request, BTN_TRIM_RELEASE);
 
+        //leitura dos fins de curso mantidas apenas para telemetria/log
         bool limitTop = buttonPressed(request, LIMIT_TOP);
         bool limitBottom = buttonPressed(request, LIMIT_BOTTOM);
 
@@ -450,15 +462,8 @@ int main()
 
             if (up && !down)
             {
-                if (limitBottom == 0)
-                {
-                    g_movement = 1;
-                    stepMotor(request, false);
-                }
-                else
-                {
-                    g_movement = 0;
-                }
+                bool stepped = stepMotor(request, false);
+                g_movement = stepped ? 1 : 0;
 
                 std::cout
                     << "\rUP:" << up
@@ -473,20 +478,14 @@ int main()
                     << " AP:" << g_autopilotActive.load()
                     << " HYD:" << g_hydraulicFailure.load()
                     << " POS:" << g_transducerPosition.load()
-                    << " | UP movimentando                  "
+                    << (stepped ? " | UP movimentando                 "
+                                : " | UP bloqueado: fim de curso INF  ")
                     << std::flush;
             }
             else if (down && !up)
             {
-                if (limitTop == 0)
-                {
-                    g_movement = -1;
-                    stepMotor(request, true);
-                }
-                else
-                {
-                    g_movement = 0;
-                }
+                bool stepped = stepMotor(request, true);
+                g_movement = stepped ? -1 : 0;
 
                 std::cout
                     << "\rUP:" << up
@@ -501,7 +500,8 @@ int main()
                     << " AP:" << g_autopilotActive.load()
                     << " HYD:" << g_hydraulicFailure.load()
                     << " POS:" << g_transducerPosition.load()
-                    << " | DOWN movimentando                "
+                    << (stepped ? " | DOWN movimentando               "
+                                : " | DOWN bloqueado: fim de curso SUP")
                     << std::flush;
             }
             else
