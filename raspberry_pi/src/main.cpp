@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdio>
 #include <fstream>
+#include <cmath>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -41,6 +42,18 @@ constexpr int MOTOR_ENA = 16;
 
 constexpr int STEP_DELAY_US = 7000;
 
+// Limites de override (célula de carga) — mesmos valores da interface
+constexpr int OVERRIDE_STOPPED_LIMIT = 30000;
+constexpr int OVERRIDE_UP_LIMIT      = 180000;
+constexpr int OVERRIDE_DOWN_LIMIT    = -180000;
+
+// Margem de segurança para área útil calibrada (evita acionar fins de curso)
+constexpr int CALIBRATION_MARGIN = 20000;
+
+// IDs de manobra recebidos via UDP (pacote P)
+constexpr int MANEUVER_NONE              = 0;
+constexpr int MANEUVER_PA_CONSTANT_MOVE  = 1;
+
 std::atomic<bool> running(true);
 
 std::atomic<bool> g_up(false);
@@ -59,13 +72,72 @@ std::atomic<int> g_hxInvalid(0);
 //  2 = trim release / motor livre
 std::atomic<int> g_movement(0);
 
+std::atomic<int> g_override(0);
 std::atomic<int> g_autopilotActive(0);
 std::atomic<int> g_hydraulicFailure(0);
 std::atomic<int> g_transducerPosition(0);
+std::atomic<int> g_maneuverId(0);
+
+// Área útil do transdutor (valores hxNet da calibragem automática)
+std::atomic<int32_t> g_hxCalMin(0);
+std::atomic<int32_t> g_hxCalMax(0);
+std::atomic<int> g_hxCalibrated(0);
+
+// Direção do movimento constante do PA: 1 = UP, -1 = DOWN
+std::atomic<int> g_paDirection(-1);
 
 void signalHandler(int)
 {
     running = false;
+}
+
+void updateOverride()
+{
+    int movement = g_movement.load();
+    int32_t hxNet = g_hxNet.load();
+    int overrideValue = 0;
+
+    if (movement == 0)
+    {
+        if (std::abs(hxNet) > OVERRIDE_STOPPED_LIMIT)
+            overrideValue = 1;
+    }
+    else if (movement == 1)
+    {
+        if (hxNet > OVERRIDE_UP_LIMIT)
+            overrideValue = 1;
+    }
+    else if (movement == -1)
+    {
+        if (hxNet < OVERRIDE_DOWN_LIMIT)
+            overrideValue = 1;
+    }
+
+    g_override = overrideValue;
+}
+
+// Define a área útil com margem de segurança em relação aos limites de override.
+void autoCalibrateTransducerUsefulArea()
+{
+    g_hxCalMin = OVERRIDE_DOWN_LIMIT + CALIBRATION_MARGIN;
+    g_hxCalMax = OVERRIDE_UP_LIMIT - CALIBRATION_MARGIN;
+    g_hxCalibrated = 1;
+
+    std::cout
+        << "Calibragem automatica: area util hxNet ["
+        << g_hxCalMin.load()
+        << ", "
+        << g_hxCalMax.load()
+        << "]"
+        << std::endl;
+}
+
+void resetPaManeuverState()
+{
+    g_paDirection = -1;
+    g_up = false;
+    g_down = false;
+    g_movement = 0;
 }
 
 bool buttonPressed(gpiod::line_request& request, int gpio)
@@ -281,7 +353,7 @@ void udpThread()
 
     while (running)
     {
-        int overrideValue = 0;
+        int overrideValue = g_override.load();
 
         char tx[256];
         std::snprintf(
@@ -335,13 +407,25 @@ void udpThread()
                 int ap = 0;
                 int hyd = 0;
                 int transducer = 0;
+                int maneuver = 0;
 
-                if (std::sscanf(buffer, "P,%d,%d,%d", &ap, &hyd, &transducer) == 3)
+                if (std::sscanf(buffer, "P,%d,%d,%d,%d", &ap, &hyd, &transducer, &maneuver) == 4)
                 {
                     g_autopilotActive = ap;
                     g_hydraulicFailure = hyd;
                     g_transducerPosition = transducer;
+                    g_maneuverId = maneuver;
                 }
+                else if (std::sscanf(buffer, "P,%d,%d,%d", &ap, &hyd, &transducer) == 3)
+                {
+                    g_autopilotActive = ap;
+                    g_hydraulicFailure = hyd;
+                    g_transducerPosition = transducer;
+                    g_maneuverId = ap ? MANEUVER_PA_CONSTANT_MOVE : MANEUVER_NONE;
+                }
+
+                if (!ap)
+                    resetPaManeuverState();
             }
         }
 
@@ -373,6 +457,98 @@ bool stepMotor(gpiod::line_request& request, bool direction)
 
     request.set_value(MOTOR_PUL, gpiod::line::value::INACTIVE);
     std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
+
+    return true;
+}
+
+// Movimento do motor sem verificar fins de curso físicos (usado pelo PA).
+bool stepMotorWithoutLimits(gpiod::line_request& request, bool direction)
+{
+    request.set_value(
+        MOTOR_DIR,
+        direction ? gpiod::line::value::ACTIVE
+                  : gpiod::line::value::INACTIVE
+    );
+
+    request.set_value(MOTOR_PUL, gpiod::line::value::ACTIVE);
+    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
+
+    request.set_value(MOTOR_PUL, gpiod::line::value::INACTIVE);
+    std::this_thread::sleep_for(std::chrono::microseconds(STEP_DELAY_US));
+
+    return true;
+}
+
+// Manobra 1: simulação de movimento constante com Piloto Automático.
+// Retorna true enquanto a manobra permanece ativa.
+bool runPaConstantMovementManeuver(gpiod::line_request& request, bool trimHold)
+{
+    if (!g_autopilotActive.load()
+        || g_maneuverId.load() != MANEUVER_PA_CONSTANT_MOVE
+        || g_hydraulicFailure.load())
+    {
+        return false;
+    }
+
+    if (!trimHold)
+        return false;
+
+    if (!g_hxCalibrated.load())
+        autoCalibrateTransducerUsefulArea();
+
+    int32_t hxNet = g_hxNet.load();
+    int32_t hxMin = g_hxCalMin.load();
+    int32_t hxMax = g_hxCalMax.load();
+    int direction = g_paDirection.load();
+
+    if (direction == 1 && hxNet >= hxMax)
+        direction = -1;
+    else if (direction == -1 && hxNet <= hxMin)
+        direction = 1;
+
+    g_paDirection = direction;
+
+    // Trim hold ativo durante o PA; beep trim físico é ignorado.
+    g_trimRelease = false;
+    request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+
+    if (direction == 1)
+    {
+        if (hxNet >= hxMax)
+        {
+            g_up = false;
+            g_down = false;
+            g_movement = 0;
+            updateOverride();
+            return g_override.load() == 0;
+        }
+
+        g_up = true;
+        g_down = false;
+        stepMotorWithoutLimits(request, false);
+        g_movement = 1;
+    }
+    else
+    {
+        if (hxNet <= hxMin)
+        {
+            g_up = false;
+            g_down = false;
+            g_movement = 0;
+            updateOverride();
+            return g_override.load() == 0;
+        }
+
+        g_up = false;
+        g_down = true;
+        stepMotorWithoutLimits(request, true);
+        g_movement = -1;
+    }
+
+    updateOverride();
+
+    if (g_override.load())
+        return false;
 
     return true;
 }
@@ -419,6 +595,8 @@ int main()
 
     request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
 
+    autoCalibrateTransducerUsefulArea();
+
     while (running)
     {
         bool up = buttonPressed(request, BTN_UP);
@@ -429,103 +607,148 @@ int main()
         bool limitTop = buttonPressed(request, LIMIT_TOP);
         bool limitBottom = buttonPressed(request, LIMIT_BOTTOM);
 
-        g_up = up;
-        g_down = down;
-        g_trimRelease = !trimRelease;
         g_limitTop = limitTop;
         g_limitBottom = limitBottom;
 
-        if (!trimRelease)
-        {
-            request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE);
-            g_movement = 2;
+        bool trimHold = trimRelease;
+        bool paRunning = runPaConstantMovementManeuver(request, trimHold);
 
-            std::cout
-                << "\rUP:" << up
-                << " DOWN:" << down
-                << " TRIM_RELEASE:1"
-                << " TOP:" << limitTop
-                << " BOTTOM:" << limitBottom
-                << " MOV:2"
-                << " HX_RAW:" << g_hxRaw.load()
-                << " HX_NET:" << g_hxNet.load()
-                << " INVALID:" << g_hxInvalid.load()
-                << " AP:" << g_autopilotActive.load()
-                << " HYD:" << g_hydraulicFailure.load()
-                << " POS:" << g_transducerPosition.load()
-                << " | TRIM RELEASE: motor livre        "
-                << std::flush;
-        }
-        else
+        if (!paRunning)
         {
-            request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
-
-            if (up && !down)
+            if (g_autopilotActive.load()
+                && g_maneuverId.load() == MANEUVER_PA_CONSTANT_MOVE
+                && (!trimHold || g_override.load()))
             {
-                bool stepped = stepMotor(request, false);
-                g_movement = stepped ? 1 : 0;
-
-                std::cout
-                    << "\rUP:" << up
-                    << " DOWN:" << down
-                    << " TRIM_RELEASE:0"
-                    << " TOP:" << limitTop
-                    << " BOTTOM:" << limitBottom
-                    << " MOV:" << g_movement.load()
-                    << " HX_RAW:" << g_hxRaw.load()
-                    << " HX_NET:" << g_hxNet.load()
-                    << " INVALID:" << g_hxInvalid.load()
-                    << " AP:" << g_autopilotActive.load()
-                    << " HYD:" << g_hydraulicFailure.load()
-                    << " POS:" << g_transducerPosition.load()
-                    << (stepped ? " | UP movimentando                 "
-                                : " | UP bloqueado: fim de curso INF  ")
-                    << std::flush;
+                resetPaManeuverState();
             }
-            else if (down && !up)
+
+            g_up = up;
+            g_down = down;
+            g_trimRelease = !trimRelease;
+
+            if (!trimRelease)
             {
-                bool stepped = stepMotor(request, true);
-                g_movement = stepped ? -1 : 0;
+                request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE);
+                g_movement = 2;
 
                 std::cout
                     << "\rUP:" << up
                     << " DOWN:" << down
-                    << " TRIM_RELEASE:0"
+                    << " TRIM_RELEASE:1"
                     << " TOP:" << limitTop
                     << " BOTTOM:" << limitBottom
-                    << " MOV:" << g_movement.load()
+                    << " MOV:2"
                     << " HX_RAW:" << g_hxRaw.load()
                     << " HX_NET:" << g_hxNet.load()
                     << " INVALID:" << g_hxInvalid.load()
+                    << " OVR:" << g_override.load()
                     << " AP:" << g_autopilotActive.load()
+                    << " MAN:" << g_maneuverId.load()
                     << " HYD:" << g_hydraulicFailure.load()
                     << " POS:" << g_transducerPosition.load()
-                    << (stepped ? " | DOWN movimentando               "
-                                : " | DOWN bloqueado: fim de curso SUP")
+                    << " | TRIM RELEASE: motor livre        "
                     << std::flush;
             }
             else
             {
-                g_movement = 0;
+                request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
 
-                std::cout
-                    << "\rUP:" << up
-                    << " DOWN:" << down
-                    << " TRIM_RELEASE:0"
-                    << " TOP:" << limitTop
-                    << " BOTTOM:" << limitBottom
-                    << " MOV:0"
-                    << " HX_RAW:" << g_hxRaw.load()
-                    << " HX_NET:" << g_hxNet.load()
-                    << " INVALID:" << g_hxInvalid.load()
-                    << " AP:" << g_autopilotActive.load()
-                    << " HYD:" << g_hydraulicFailure.load()
-                    << " POS:" << g_transducerPosition.load()
-                    << " | Motor parado/travado             "
-                    << std::flush;
+                if (up && !down)
+                {
+                    bool stepped = stepMotor(request, false);
+                    g_movement = stepped ? 1 : 0;
+                    updateOverride();
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    std::cout
+                        << "\rUP:" << up
+                        << " DOWN:" << down
+                        << " TRIM_RELEASE:0"
+                        << " TOP:" << limitTop
+                        << " BOTTOM:" << limitBottom
+                        << " MOV:" << g_movement.load()
+                        << " HX_RAW:" << g_hxRaw.load()
+                        << " HX_NET:" << g_hxNet.load()
+                        << " INVALID:" << g_hxInvalid.load()
+                        << " OVR:" << g_override.load()
+                        << " AP:" << g_autopilotActive.load()
+                        << " MAN:" << g_maneuverId.load()
+                        << " HYD:" << g_hydraulicFailure.load()
+                        << " POS:" << g_transducerPosition.load()
+                        << (stepped ? " | UP movimentando                 "
+                                    : " | UP bloqueado: fim de curso INF  ")
+                        << std::flush;
+                }
+                else if (down && !up)
+                {
+                    bool stepped = stepMotor(request, true);
+                    g_movement = stepped ? -1 : 0;
+                    updateOverride();
+
+                    std::cout
+                        << "\rUP:" << up
+                        << " DOWN:" << down
+                        << " TRIM_RELEASE:0"
+                        << " TOP:" << limitTop
+                        << " BOTTOM:" << limitBottom
+                        << " MOV:" << g_movement.load()
+                        << " HX_RAW:" << g_hxRaw.load()
+                        << " HX_NET:" << g_hxNet.load()
+                        << " INVALID:" << g_hxInvalid.load()
+                        << " OVR:" << g_override.load()
+                        << " AP:" << g_autopilotActive.load()
+                        << " MAN:" << g_maneuverId.load()
+                        << " HYD:" << g_hydraulicFailure.load()
+                        << " POS:" << g_transducerPosition.load()
+                        << (stepped ? " | DOWN movimentando               "
+                                    : " | DOWN bloqueado: fim de curso SUP")
+                        << std::flush;
+                }
+                else
+                {
+                    g_movement = 0;
+                    updateOverride();
+
+                    std::cout
+                        << "\rUP:" << up
+                        << " DOWN:" << down
+                        << " TRIM_RELEASE:0"
+                        << " TOP:" << limitTop
+                        << " BOTTOM:" << limitBottom
+                        << " MOV:0"
+                        << " HX_RAW:" << g_hxRaw.load()
+                        << " HX_NET:" << g_hxNet.load()
+                        << " INVALID:" << g_hxInvalid.load()
+                        << " OVR:" << g_override.load()
+                        << " AP:" << g_autopilotActive.load()
+                        << " MAN:" << g_maneuverId.load()
+                        << " HYD:" << g_hydraulicFailure.load()
+                        << " POS:" << g_transducerPosition.load()
+                        << " | Motor parado/travado             "
+                        << std::flush;
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
             }
+        }
+        else
+        {
+            std::cout
+                << "\rUP:" << (g_up.load() ? 1 : 0)
+                << " DOWN:" << (g_down.load() ? 1 : 0)
+                << " TRIM_RELEASE:0"
+                << " TOP:" << limitTop
+                << " BOTTOM:" << limitBottom
+                << " MOV:" << g_movement.load()
+                << " HX_RAW:" << g_hxRaw.load()
+                << " HX_NET:" << g_hxNet.load()
+                << " INVALID:" << g_hxInvalid.load()
+                << " OVR:" << g_override.load()
+                << " AP:" << g_autopilotActive.load()
+                << " MAN:" << g_maneuverId.load()
+                << " HYD:" << g_hydraulicFailure.load()
+                << " POS:" << g_transducerPosition.load()
+                << " | PA: movimento constante          "
+                << std::flush;
         }
     }
 
