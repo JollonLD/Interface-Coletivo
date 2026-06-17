@@ -1,4 +1,4 @@
-# Install script for directory: /home/pierrot/Documents/Interface-Coletivo/raspberry_pi
+# Install script for directory: /home/coletivo/Interface-Coletivo/raspberry_pi
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -50,5 +50,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "/home/pierrot/Documents/Interface-Coletivo/raspberry_pi/build/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "/home/coletivo/Interface-Coletivo/raspberry_pi/build/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")

@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from scca.styles import DASHBOARD_QSS
-from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot
+from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot, MANEUVER_IDS
 
 
 class ToggleSliderButton(QAbstractButton):
@@ -764,6 +764,7 @@ class SccaDashboard(QMainWindow):
             autopilot_active=autopilot_active,
             hydraulic_failure=hydraulic_failure,
             transducer_position=max(0, self._transducer_cmd),
+            maneuver_id=MANEUVER_IDS.get(self._selected_maneuver_name, 0) if autopilot_active else 0,
         )
 
     def _extract_telemetry(self, packet_dict: dict) -> dict:

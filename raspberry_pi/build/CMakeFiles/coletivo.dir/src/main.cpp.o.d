@@ -1,5 +1,5 @@
 CMakeFiles/coletivo.dir/src/main.cpp.o: \
- /home/pierrot/Documents/Interface-Coletivo/raspberry_pi/src/main.cpp \
+ /home/coletivo/Interface-Coletivo/raspberry_pi/src/main.cpp \
  /usr/include/stdc-predef.h /usr/include/gpiod.hpp \
  /usr/include/c++/13/bitset /usr/include/c++/13/bits/functexcept.h \
  /usr/include/x86_64-linux-gnu/c++/13/bits/c++config.h \

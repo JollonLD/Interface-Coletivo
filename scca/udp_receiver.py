@@ -19,6 +19,13 @@ from PySide6.QtNetwork import QHostAddress, QUdpSocket, QAbstractSocket
 
 logger = logging.getLogger(__name__)
 
+MANEUVER_IDS: dict[str, int] = {
+    "Manobra 1": 1,
+    "Manobra 2": 2,
+    "Manobra 3": 3,
+    "Manobra 4": 4,
+}
+
 
 @dataclass
 class UDPPacket:
@@ -332,6 +339,7 @@ class CommandSender(QObject):
         self.autopilot_active = False
         self.hydraulic_failure = False
         self.transducer_position = 0
+        self.maneuver_id = 0
         self._send_interval_ms = max(50, min(150, int(send_interval_ms)))
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._send_periodic_control)
@@ -368,6 +376,7 @@ class CommandSender(QObject):
         autopilot_active: Optional[bool] = None,
         hydraulic_failure: Optional[bool] = None,
         transducer_position: Optional[int] = None,
+        maneuver_id: Optional[int] = None,
     ) -> None:
         if autopilot_active is not None:
             self.autopilot_active = bool(autopilot_active)
@@ -375,11 +384,13 @@ class CommandSender(QObject):
             self.hydraulic_failure = bool(hydraulic_failure)
         if transducer_position is not None:
             self.transducer_position = int(transducer_position)
+        if maneuver_id is not None:
+            self.maneuver_id = int(maneuver_id)
 
     def _build_control_payload(self) -> bytes:
         return (
             f"P,{int(self.autopilot_active)},{int(self.hydraulic_failure)},"
-            f"{int(self.transducer_position)}"
+            f"{int(self.transducer_position)},{int(self.maneuver_id)}"
         ).encode("utf-8")
 
     def _send_periodic_control(self) -> None:
@@ -400,6 +411,7 @@ class CommandSender(QObject):
                         "autopilot_active": self.autopilot_active,
                         "hydraulic_failure": self.hydraulic_failure,
                         "transducer_position": self.transducer_position,
+                        "maneuver_id": self.maneuver_id,
                     }
                 )
                 return True
@@ -431,9 +443,12 @@ class CommandSender(QObject):
             bool: True se enviado com sucesso, False caso contrário
         """
         try:
-            del maneuver_name
+            maneuver_id = MANEUVER_IDS.get(maneuver_name, 0)
             del parameters
-            self.set_control_state(autopilot_active=(str(action).lower() != "stop"))
+            self.set_control_state(
+                autopilot_active=(str(action).lower() != "stop"),
+                maneuver_id=maneuver_id if str(action).lower() != "stop" else 0,
+            )
             return self._send_control_packet()
         except Exception as e:
             error_msg = f"Exceção ao enviar comando: {str(e)}"
@@ -526,6 +541,8 @@ class MockRaspberryAutopilot(QObject):
         self._t = 0.0
         self._dt = 0.1
         self._transducer_position = int(self.position_percent * 100.0)
+        self.maneuver_id = 0
+        self._pa_direction = 1
 
     def start(self, interval_ms: int = 50) -> bool:
         try:
@@ -572,17 +589,29 @@ class MockRaspberryAutopilot(QObject):
             payload = bytes(dg.data()).decode("utf-8", errors="ignore").strip()
             try:
                 parts = [part.strip() for part in payload.split(",")]
-                if len(parts) != 4 or parts[0] != "P":
+                if len(parts) == 5 and parts[0] == "P":
+                    autopilot_active = bool(int(parts[1]))
+                    hydraulic_failure = bool(int(parts[2]))
+                    transducer_position = int(parts[3])
+                    maneuver_id = int(parts[4])
+                elif len(parts) == 4 and parts[0] == "P":
+                    autopilot_active = bool(int(parts[1]))
+                    hydraulic_failure = bool(int(parts[2]))
+                    transducer_position = int(parts[3])
+                    maneuver_id = 1 if autopilot_active else 0
+                else:
                     continue
-                autopilot_active = bool(int(parts[1]))
-                hydraulic_failure = bool(int(parts[2]))
-                transducer_position = int(parts[3])
             except Exception:
                 continue
 
             self.pa_active = autopilot_active
             self.hydraulic_failure = hydraulic_failure
             self._transducer_position = transducer_position
+            self.maneuver_id = maneuver_id
+            self.selected_maneuver = next(
+                (name for name, mid in MANEUVER_IDS.items() if mid == maneuver_id),
+                "Manobra 1",
+            )
             self.maneuver_active = autopilot_active
             self.maneuver_state = "RUNNING" if autopilot_active else "IDLE"
             self.trim_hold = not autopilot_active
@@ -610,6 +639,26 @@ class MockRaspberryAutopilot(QObject):
             self.pilot_force_kg = 0.0
             self.beep_trim = "DOWN"
             self.trim_hold = True
+        elif self.maneuver_active and self.maneuver_id == 1:
+            prev = self.position_percent
+            self.position_percent += 0.35 if self._pa_direction > 0 else -0.35
+            if self.position_percent >= 85.0:
+                self.position_percent = 85.0
+                self._pa_direction = -1
+            elif self.position_percent <= 15.0:
+                self.position_percent = 15.0
+                self._pa_direction = 1
+
+            slope = self.position_percent - prev
+            if slope > 0.05:
+                self.beep_trim = "UP"
+            elif slope < -0.05:
+                self.beep_trim = "DOWN"
+            else:
+                self.beep_trim = "NEUTRAL"
+            self.pilot_force_kg = max(0.0, min(8.0, abs(slope) * 0.8 + 1.2))
+            self.trim_hold = True
+            self._t += self._dt
         elif self.maneuver_active:
             prev = self.position_percent
             target_percent = max(0.0, min(100.0, self._transducer_position / 100.0))
