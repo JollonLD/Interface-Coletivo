@@ -53,6 +53,10 @@ std::atomic<int32_t> g_hxRaw(0);
 std::atomic<int32_t> g_hxNet(0);
 std::atomic<int> g_hxInvalid(0);
 
+std::atomic<int> g_posMin(0);
+std::atomic<int> g_posMax(0);
+std::atomic<bool> g_calibrated(false);
+
 //  1 = UP
 // -1 = DOWN
 //  0 = parado/travado
@@ -377,6 +381,72 @@ bool stepMotor(gpiod::line_request& request, bool direction)
     return true;
 }
 
+bool runCalibration(gpiod::line_request& request)
+{
+    std::cout << "\n[CALIB] Iniciando calibragem automática..." << std::endl;
+
+    while (running)
+    {
+        bool stepped = stepMotor(request, true);
+
+        if (!stepped)
+            break;
+
+        //aguarda o transdutor estabilizar entre passos.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (!running)
+        return false;
+
+    //estabilização antes de amostrar o transdutor.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    g_posMin = g_transducerPosition.load();
+
+    std::cout << "[CALIB] Fim de curso inferior atingido. posMin = "
+              << g_posMin.load() << std::endl;
+
+    while (running)
+    {
+        bool stepped = stepMotor(request, false);
+
+        if (!stepped)
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (!running)
+        return false;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    g_posMax = g_transducerPosition.load();
+
+    std::cout << "[CALIB] Fim de curso superior atingido. posMax = "
+              << g_posMax.load() << std::endl;
+
+    if (g_posMin.load() >= g_posMax.load())
+    {
+        std::cerr << "[CALIB] ERRO: posMin >= posMax." << std::endl;
+        return false;
+    }
+
+    g_calibrated = true;
+
+    std::cout << "[CALIB] Calibragem concluída: ["
+              << g_posMin.load() << ", " << g_posMax.load() << "]" << std::endl;
+
+    return true;
+}
+
+bool positionWithinCalibration(int targetPosition)
+{
+    return (targetPosition >= g_posMin.load()) &&
+           (targetPosition <= g_posMax.load());
+}
+
 int main()
 {
     std::signal(SIGINT, signalHandler);
@@ -419,6 +489,17 @@ int main()
 
     request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
 
+    if (!runCalibration(request))
+    {
+        std::cerr << "[MAIN] Calibragem falhou ou foi interrompida. Encerrando." << std::endl;
+        running = false;
+
+        if (hxThread.joinable())      hxThread.join();
+        if (udpComThread.joinable())  udpComThread.join();
+
+        return 1;
+    }
+    
     while (running)
     {
         bool up = buttonPressed(request, BTN_UP);
