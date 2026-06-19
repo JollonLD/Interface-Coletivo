@@ -385,25 +385,44 @@ bool runCalibration(gpiod::line_request& request)
 {
     std::cout << "\n[CALIB] Iniciando calibragem automática..." << std::endl;
 
+    // ---- DIAGNÓSTICO TEMPORÁRIO ----
+    std::cout << "[CALIB][DIAG] g_transducerPosition ANTES de mover: "
+              << g_transducerPosition.load() << std::endl;
+    // ---------------------------------
+
+    int lastPrintedPos = g_transducerPosition.load();
+
     while (running)
     {
-        bool stepped = stepMotor(request, true);
+        bool stepped = stepMotor(request, true);  // DOWN
 
         if (!stepped)
             break;
 
-        //aguarda o transdutor estabilizar entre passos.
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // ---- DIAGNÓSTICO: imprime só quando o valor muda ----
+        int currentPos = g_transducerPosition.load();
+        if (currentPos != lastPrintedPos)
+        {
+            std::cout << "[CALIB][DIAG] pos mudou: " << currentPos << std::endl;
+            lastPrintedPos = currentPos;
+        }
     }
+
+    std::cout << "[CALIB][DIAG] g_transducerPosition IMEDIATAMENTE após break: "
+              << g_transducerPosition.load() << std::endl;
 
     if (!running)
         return false;
 
-    //estabilização antes de amostrar o transdutor.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    g_posMin = g_transducerPosition.load();
+    std::cout << "[CALIB][DIAG] g_transducerPosition APÓS sleep 200ms: "
+              << g_transducerPosition.load() << std::endl;
 
+    g_posMin = g_transducerPosition.load();
+    
     std::cout << "[CALIB] Fim de curso inferior atingido. posMin = "
               << g_posMin.load() << std::endl;
 
