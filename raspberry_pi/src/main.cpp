@@ -296,7 +296,9 @@ void udpThread()
             g_down.load() ? 1 : 0,
             g_trimRelease.load() ? 1 : 0,
             overrideValue,
-            g_hxNet.load()
+            g_hxNet.load(),
+            g_posMin.load(),
+            g_posMax.load()
         );
 
         sendto(
@@ -448,7 +450,7 @@ bool runCalibration(gpiod::line_request& request)
 
     if (g_posMin.load() >= g_posMax.load())
     {
-        std::cerr << "[CALIB] ERRO: posMin >= posMax." << std::endl;
+        std::cerr << "[CALIB] ERRO: posMin (" <<g_posMin.load() << ") >= posMax (" <<g_posMax.load() << ")."  << std::endl;
         return false;
     }
 
