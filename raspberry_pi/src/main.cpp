@@ -291,7 +291,7 @@ void udpThread()
         std::snprintf(
             tx,
             sizeof(tx),
-            "C,%d,%d,%d,%d,%d",
+            "C,%d,%d,%d,%d,%d,%d,%d",
             g_up.load() ? 1 : 0,
             g_down.load() ? 1 : 0,
             g_trimRelease.load() ? 1 : 0,
