@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdio>
 #include <fstream>
+#include <algorithm>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -53,8 +54,8 @@ std::atomic<int32_t> g_hxRaw(0);
 std::atomic<int32_t> g_hxNet(0);
 std::atomic<int> g_hxInvalid(0);
 
-std::atomic<int> g_posMin(0);
-std::atomic<int> g_posMax(0);
+std::atomic<int> g_posTop(0);
+std::atomic<int> g_posBottom(0);
 std::atomic<bool> g_calibrated(false);
 
 //  1 = UP
@@ -297,8 +298,8 @@ void udpThread()
             g_trimRelease.load() ? 1 : 0,
             overrideValue,
             g_hxNet.load(),
-            g_posMin.load(),
-            g_posMax.load()
+            g_posTop.load(),
+            g_posBottom.load()
         );
 
         sendto(
@@ -387,50 +388,29 @@ bool runCalibration(gpiod::line_request& request)
 {
     std::cout << "\n[CALIB] Iniciando calibragem automática..." << std::endl;
 
-    // ---- DIAGNÓSTICO TEMPORÁRIO ----
-    std::cout << "[CALIB][DIAG] g_transducerPosition ANTES de mover: "
-              << g_transducerPosition.load() << std::endl;
-    // ---------------------------------
-
-    int lastPrintedPos = g_transducerPosition.load();
-
     while (running)
     {
-        bool stepped = stepMotor(request, true);  // DOWN
+        bool stepped = stepMotor(request, false);  // DOWN (direction=false desce, em direção a LIMIT_BOTTOM)
 
         if (!stepped)
             break;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-        // ---- DIAGNÓSTICO: imprime só quando o valor muda ----
-        int currentPos = g_transducerPosition.load();
-        if (currentPos != lastPrintedPos)
-        {
-            std::cout << "[CALIB][DIAG] pos mudou: " << currentPos << std::endl;
-            lastPrintedPos = currentPos;
-        }
     }
-
-    std::cout << "[CALIB][DIAG] g_transducerPosition IMEDIATAMENTE após break: "
-              << g_transducerPosition.load() << std::endl;
 
     if (!running)
         return false;
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    std::cout << "[CALIB][DIAG] g_transducerPosition APÓS sleep 200ms: "
-              << g_transducerPosition.load() << std::endl;
-
-    g_posMin = g_transducerPosition.load();
+    g_posBottom = g_transducerPosition.load();
     
-    std::cout << "[CALIB] Fim de curso inferior atingido. posMin = "
-              << g_posMin.load() << std::endl;
+    std::cout << "[CALIB] Fim de curso inferior (LIMIT_BOTTOM) atingido. posBottom = "
+              << g_posBottom.load() << std::endl;
 
     while (running)
     {
-        bool stepped = stepMotor(request, false);
+        bool stepped = stepMotor(request, true);
 
         if (!stepped)
             break;
@@ -443,29 +423,31 @@ bool runCalibration(gpiod::line_request& request)
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    g_posMax = g_transducerPosition.load();
+    g_posTop = g_transducerPosition.load();
 
-    std::cout << "[CALIB] Fim de curso superior atingido. posMax = "
-              << g_posMax.load() << std::endl;
+    std::cout << "[CALIB] Fim de curso superior (LIMIT_TOP) atingido. posTop = "
+              << g_posTop.load() << std::endl;
 
-    if (g_posMin.load() >= g_posMax.load())
+    if (g_posTop.load() == g_posBottom.load())
     {
-        std::cerr << "[CALIB] ERRO: posMin (" <<g_posMin.load() << ") >= posMax (" <<g_posMax.load() << ")."  << std::endl;
+        std::cerr << "[CALIB] ERRO: posTop (" <<g_posTop.load() << ") == posBottom (" <<g_posBottom.load() << "). "
+                  << "Fins de curso não produziram leituras distintas." << std::endl;
         return false;
     }
 
     g_calibrated = true;
 
-    std::cout << "[CALIB] Calibragem concluída: ["
-              << g_posMin.load() << ", " << g_posMax.load() << "]" << std::endl;
+    std::cout << "[CALIB] Calibragem concluída: posTop (LIMIT_TOP) = "
+              << g_posTop.load() << ", posBottom (LIMIT_BOTTOM) = " << g_posBottom.load() << std::endl;
 
     return true;
 }
 
 bool positionWithinCalibration(int targetPosition)
 {
-    return (targetPosition >= g_posMin.load()) &&
-           (targetPosition <= g_posMax.load());
+    int lowerBound = std::min(g_posTop.load(), g_posBottom.load());
+    int upperBound = std::max(g_posTop.load(), g_posBottom.load());
+    return (targetPosition >= lowerBound) && (targetPosition <= upperBound);
 }
 
 int main()
