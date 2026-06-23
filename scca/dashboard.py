@@ -29,7 +29,9 @@ from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot
 
 
 class ToggleSliderButton(QAbstractButton):
-    def __init__(self, text: str, danger: bool = False, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, text: str, danger: bool = False, parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
         self.setText(text)
         self.setCheckable(True)
@@ -50,7 +52,11 @@ class ToggleSliderButton(QAbstractButton):
         painter.setPen(QColor("#dbe5ef"))
         painter.setFont(QFont("Rajdhani", 12, QFont.Weight.Bold))
         text_rect = self.rect().adjusted(12, 0, -92, 0)
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            self.text(),
+        )
 
         track_w = 52
         track_h = 26
@@ -81,7 +87,9 @@ class ToggleSliderButton(QAbstractButton):
 
 
 class LedIndicator(QWidget):
-    def __init__(self, color_on: str, color_off: str = "#3b4754", parent: QWidget | None = None) -> None:
+    def __init__(
+        self, color_on: str, color_off: str = "#3b4754", parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
         self.setFixedSize(18, 18)
         self.color_on = QColor(color_on)
@@ -124,17 +132,23 @@ class CircularForceGauge(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        painter.setPen(QPen(QColor("#243548"), 14, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setPen(
+            QPen(QColor("#243548"), 14, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        )
         painter.drawArc(rect_x, rect_y, side, side, 225 * 16, -270 * 16)
 
         span = int((self.kg_value / self.max_kg) * 270)
-        painter.setPen(QPen(QColor("#f58f2d"), 14, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setPen(
+            QPen(QColor("#f58f2d"), 14, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        )
         painter.drawArc(rect_x, rect_y, side, side, 225 * 16, -span * 16)
 
         painter.setPen(QColor("#eaf3ff"))
         value_font = QFont("Rajdhani", 26, QFont.Weight.Bold)
         painter.setFont(value_font)
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.kg_value:04.1f} KG")
+        painter.drawText(
+            self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.kg_value:04.1f} KG"
+        )
 
         newtons = self.kg_value * 9.80665
         sub_rect = self.rect().adjusted(0, 48, 0, 0)
@@ -146,7 +160,13 @@ class CircularForceGauge(QWidget):
         painter.setPen(QColor("#7f93a8"))
         tick_font = QFont("Rajdhani", 10, QFont.Weight.Medium)
         painter.setFont(tick_font)
-        for pct, label in [(0.0, "0"), (0.25, "20"), (0.5, "40"), (0.75, "60"), (1.0, "80")]:
+        for pct, label in [
+            (0.0, "0"),
+            (0.25, "20"),
+            (0.5, "40"),
+            (0.75, "60"),
+            (1.0, "80"),
+        ]:
             angle_deg = 225 - (270 * pct)
             rad = math.radians(angle_deg)
             r = (side / 2) - 4
@@ -167,11 +187,18 @@ class LinuxJoystickReader(QObject):
         self.device_path = os.getenv("SCCA_JOYSTICK_DEVICE", "/dev/input/js0")
         axis_env = os.getenv("SCCA_JOYSTICK_AXIS", "")
         self.axis_number = int(axis_env) if axis_env.strip().isdigit() else None
-        self.invert_axis = os.getenv("SCCA_JOYSTICK_INVERT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.invert_axis = os.getenv("SCCA_JOYSTICK_INVERT", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.min_raw = int(os.getenv("SCCA_JOYSTICK_MIN_RAW", "32767"))
         self.max_raw = int(os.getenv("SCCA_JOYSTICK_MAX_RAW", "-32767"))
         self.smoothing_alpha = float(os.getenv("SCCA_JOYSTICK_SMOOTHING_ALPHA", "0.18"))
-        self.deadband_percent = float(os.getenv("SCCA_JOYSTICK_DEADBAND_PERCENT", "0.25"))
+        self.deadband_percent = float(
+            os.getenv("SCCA_JOYSTICK_DEADBAND_PERCENT", "0.25")
+        )
         self.smoothing_alpha = max(0.01, min(1.0, self.smoothing_alpha))
         self.deadband_percent = max(0.0, min(5.0, self.deadband_percent))
         self._fd: int | None = None
@@ -221,7 +248,9 @@ class LinuxJoystickReader(QObject):
             return False
         except PermissionError as exc:
             self._close_device()
-            self.error_occurred.emit(f"Sem permissão para ler {self.device_path}: {exc}")
+            self.error_occurred.emit(
+                f"Sem permissão para ler {self.device_path}: {exc}"
+            )
             return False
         except OSError as exc:
             self._close_device()
@@ -266,7 +295,9 @@ class LinuxJoystickReader(QObject):
             except BlockingIOError:
                 break
             except OSError as exc:
-                self.error_occurred.emit(f"Erro ao ler joystick em {self.device_path}: {exc}")
+                self.error_occurred.emit(
+                    f"Erro ao ler joystick em {self.device_path}: {exc}"
+                )
                 self._close_device()
                 return
 
@@ -301,7 +332,9 @@ class SccaDashboard(QMainWindow):
         self.udp_receiver = UDPReceiver(host="0.0.0.0", port=5006)
         self.udp_receiver.packet_received.connect(self._on_udp_packet_received)
         self.udp_receiver.error_occurred.connect(self._on_udp_error)
-        self.udp_receiver.connection_status_changed.connect(self._on_udp_connection_changed)
+        self.udp_receiver.connection_status_changed.connect(
+            self._on_udp_connection_changed
+        )
 
         # Inicializar Command Sender (envia manobras para Raspberry Pi)
         initial_host = os.getenv("SCCA_COMMAND_HOST", "127.0.0.1")
@@ -370,8 +403,12 @@ class SccaDashboard(QMainWindow):
         body.addWidget(states_panel)
 
         self.joystick_reader = LinuxJoystickReader()
-        self.joystick_reader.position_changed.connect(self._on_joystick_position_changed)
-        self.joystick_reader.connection_changed.connect(self._on_joystick_connection_changed)
+        self.joystick_reader.position_changed.connect(
+            self._on_joystick_position_changed
+        )
+        self.joystick_reader.connection_changed.connect(
+            self._on_joystick_connection_changed
+        )
         self.joystick_reader.error_occurred.connect(self._on_joystick_error)
 
         self.flash_timer = QTimer(self)
@@ -389,7 +426,7 @@ class SccaDashboard(QMainWindow):
         self.control_timer = QTimer(self)
         self.control_timer.setInterval(int(self._control_tick_s * 1000.0))
         self.control_timer.timeout.connect(self._update_control_stream_state)
-        
+
         # Logger
         self.logger = logging.getLogger("Dashboard")
 
@@ -422,7 +459,9 @@ class SccaDashboard(QMainWindow):
         self.position_bar.setRange(0, 1000)
         self.position_bar.setValue(523)
         self.position_bar.setFixedWidth(64)
-        self.position_bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.position_bar.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        )
         self.position_bar.setTextVisible(False)
 
         self.position_display = QLabel("52.3%")
@@ -496,7 +535,9 @@ class SccaDashboard(QMainWindow):
         layout.addWidget(head)
 
         self.force_gauge = CircularForceGauge()
-        self.force_gauge.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.force_gauge.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         layout.addWidget(self.force_gauge, alignment=Qt.AlignmentFlag.AlignCenter)
 
         raw_frame = QFrame()
@@ -580,7 +621,7 @@ class SccaDashboard(QMainWindow):
         self.maneuver_buttons: dict[str, QPushButton] = {}
         # Lista de manobras disponíveis
         maneuvers = ["Manobra 1", "Manobra 2", "Manobra 3", "Manobra 4"]
-        
+
         for idx, name in enumerate(maneuvers):
             btn = QPushButton(name)
             btn.setObjectName("matrixTile")
@@ -588,7 +629,9 @@ class SccaDashboard(QMainWindow):
             btn.setProperty("runState", "idle")
             btn.setCheckable(True)
             btn.setMinimumSize(170, 96)
-            btn.toggled.connect(lambda checked, mn=name: self._toggle_maneuver_command(mn, checked))
+            btn.toggled.connect(
+                lambda checked, mn=name: self._toggle_maneuver_command(mn, checked)
+            )
             self.maneuver_buttons[name] = btn
             matrix.addWidget(btn, idx // 2, idx % 2)
 
@@ -601,7 +644,9 @@ class SccaDashboard(QMainWindow):
         self.pane_tile.toggled.connect(self._send_hydraulic_failure_command)
         matrix.addWidget(self.pane_tile, 1, 1)
 
-        self.maneuver_hint = QLabel("Clique em uma manobra para enviar comando ao Raspberry Pi")
+        self.maneuver_hint = QLabel(
+            "Clique em uma manobra para enviar comando ao Raspberry Pi"
+        )
         self.maneuver_hint.setObjectName("subtitle")
 
         layout.addLayout(matrix)
@@ -682,7 +727,9 @@ class SccaDashboard(QMainWindow):
             self.logger.info(f"Enviando comando de manobra: {maneuver_name}")
             self.command_sender.send_maneuver_command(maneuver_name, action="start")
             self._selected_maneuver_name = maneuver_name
-            self.maneuver_hint.setText(f"Comando enviado: {maneuver_name} | Executando...")
+            self.maneuver_hint.setText(
+                f"Comando enviado: {maneuver_name} | Executando..."
+            )
         else:
             self.logger.info(f"Cancelando manobra: {maneuver_name}")
             self.command_sender.send_maneuver_stop(maneuver_name)
@@ -699,7 +746,9 @@ class SccaDashboard(QMainWindow):
         if enabled:
             ok = self.mock_raspberry.start(interval_ms=100)
             if ok:
-                self.maneuver_hint.setText("Mock Raspberry ativo | Comandos locais habilitados")
+                self.maneuver_hint.setText(
+                    "Mock Raspberry ativo | Comandos locais habilitados"
+                )
             else:
                 self.toggle_mock_mode.blockSignals(True)
                 self.toggle_mock_mode.setChecked(False)
@@ -754,22 +803,27 @@ class SccaDashboard(QMainWindow):
 
         self._control_time_s += self._control_tick_s
         if autopilot_active and active_maneuver is not None:
+            # Se for Autopilot, envia a referência gerada pela manobra
             self._selected_maneuver_name = active_maneuver
-            self._transducer_cmd = self._maneuver_transducer_profile(active_maneuver, self._control_time_s)
+            self._transducer_cmd = self._maneuver_transducer_profile(
+                active_maneuver, self._control_time_s
+            )
+            pos_to_send = max(0, self._transducer_cmd)
         else:
-            # Sem manobra ativa, retorna o comando para zero sem salto brusco.
-            self._transducer_cmd = int(self._transducer_cmd * 0.85)
+            # ADICIONE ESTA LÓGICA: Se for voo manual, o PC é apenas uma ponte (pass-through)
+            # Envia a posição real lida do Arduino para o Raspberry Pi
+            pos_to_send = getattr(self, "_current_joystick_pos", 0)
 
         self.command_sender.set_control_state(
             autopilot_active=autopilot_active,
             hydraulic_failure=hydraulic_failure,
-            transducer_position=max(0, self._transducer_cmd),
+            transducer_position=pos_to_send,
         )
 
     def _extract_telemetry(self, packet_dict: dict) -> dict:
         """Normaliza o payload UDP para o mesmo formato usado pela GUI."""
-        parsed = packet_dict.get("parsed_data", packet_dict)
-        if not isinstance(parsed, dict):
+        parsed = packet_dict.get("parsed_data", {})
+        if not isinstance(parsed, dict) or not parsed:
             return {}
 
         def to_float(value: object, default: float) -> float:
@@ -778,43 +832,86 @@ class SccaDashboard(QMainWindow):
             except (TypeError, ValueError):
                 return default
 
-        raw_load_cell = parsed.get("load_cell")
+        # Extração resiliente: usa .get() com valor padrão 0 se o campo não existir
+        beep_up = int(parsed.get("beep_trim_up", 0))
+        beep_down = int(parsed.get("beep_trim_down", 0))
+        trim_release = int(parsed.get("trim_release", 0))
+        load_cell = int(parsed.get("load_cell", 0))
 
-        if all(k in parsed for k in ("beep_trim_up", "beep_trim_down", "trim_release", "override", "load_cell")):
-            beep_up = int(parsed.get("beep_trim_up", 0))
-            beep_down = int(parsed.get("beep_trim_down", 0))
-            trim_release = int(parsed.get("trim_release", 0))
-            load_cell = int(parsed.get("load_cell", 0))
+        # Novos campos de calibração
+        pos_min = int(parsed.get("pos_min", 0))
+        pos_max = int(parsed.get("pos_max", 0))
 
-            if beep_up:
-                beep_trim = "UP"
-            elif beep_down:
-                beep_trim = "DOWN"
-            else:
-                beep_trim = "NEUTRAL"
+        if beep_up:
+            beep_trim = "UP"
+        elif beep_down:
+            beep_trim = "DOWN"
+        else:
+            beep_trim = "NEUTRAL"
 
-            pilot_force_kg = max(0.0, to_float(load_cell, 0.0) / 10.0)
-            return {
-                "trim_hold": trim_release == 0,
-                "beep_trim": beep_trim,
-                "pa_active": any(btn.isChecked() for btn in self.maneuver_buttons.values()),
-                "hydraulic_failure": bool(self.pane_tile.isChecked()),
-                "raw_load_cell": raw_load_cell,
-                "pilot_force_kg": pilot_force_kg,
-                "udp_connected": True,
-                "usb_connected": True,
-                "selected_maneuver": next((n for n, b in self.maneuver_buttons.items() if b.isChecked()), "Manobra 1"),
-                "maneuver_active": any(btn.isChecked() for btn in self.maneuver_buttons.values()),
-                "maneuver_state": "RUNNING" if any(btn.isChecked() for btn in self.maneuver_buttons.values()) else "IDLE",
-                "timestamp": to_float(packet_dict.get("timestamp", time.time()), time.time()),
-            }
+        pilot_force_kg = max(0.0, to_float(load_cell, 0.0) / 10.0)
 
-        return {}
+        # Retorna o dicionário completo, agora incluindo os dados de calibração
+        return {
+            "trim_hold": trim_release == 0,
+            "beep_trim": beep_trim,
+            "pa_active": any(btn.isChecked() for btn in self.maneuver_buttons.values()),
+            "hydraulic_failure": bool(self.pane_tile.isChecked()),
+            "raw_load_cell": load_cell,
+            "pilot_force_kg": pilot_force_kg,
+            "udp_connected": True,
+            "usb_connected": True,
+            "pos_min": pos_min,  # Incluído para o _apply_dashboard_telemetry usar
+            "pos_max": pos_max,  # Incluído para o _apply_dashboard_telemetry usar
+            "selected_maneuver": next(
+                (n for n, b in self.maneuver_buttons.items() if b.isChecked()),
+                "Manobra 1",
+            ),
+            "maneuver_active": any(
+                btn.isChecked() for btn in self.maneuver_buttons.values()
+            ),
+            "maneuver_state": "RUNNING"
+            if any(btn.isChecked() for btn in self.maneuver_buttons.values())
+            else "IDLE",
+            "timestamp": to_float(
+                packet_dict.get("timestamp", time.time()), time.time()
+            ),
+        }
 
     def _apply_dashboard_telemetry(self, data: dict, source: str) -> None:
         """Atualiza os widgets principais com a telemetria recebida."""
+        # --- NOVA LÓGICA DE CALIBRAÇÃO DINÂMICA ---
+        pos_min = data.get("pos_min", 0)
+        pos_max = data.get("pos_max", 0)
+        pos_atual_raw = getattr(self, "_current_joystick_pos", 0)
+
+        # Só calcula a percentagem se a calibração for válida (min != max)
+        if pos_min != pos_max:
+            # Garante que os limites estão ordenados corretamente (dependendo se inverte ou não)
+            limite_inferior = min(pos_min, pos_max)
+            limite_superior = max(pos_min, pos_max)
+
+            # Limita a leitura física dentro da janela calibrada (Bloqueio D)
+            pos_clipada = max(limite_inferior, min(limite_superior, pos_atual_raw))
+
+            # Calcula a percentagem real (0.0 a 100.0)
+            range_total = limite_superior - limite_inferior
+            if range_total > 0:
+                percentagem = ((pos_clipada - limite_inferior) / range_total) * 100.0
+
+                # Se o eixo for invertido (posMin > posMax), inverte a percentagem
+                if pos_min > pos_max:
+                    percentagem = 100.0 - percentagem
+
+                # Atualiza a barra na tela
+                self.position_bar.setValue(int(percentagem * 10))
+                self.position_display.setText(f"{percentagem:.1f}%")
+        # ------------------------------------------
+
         raw_load_cell = data.get("raw_load_cell")
-        self.raw_load_cell_value.setText("--" if raw_load_cell is None else str(raw_load_cell))
+        self.raw_load_cell_value.setText(
+            "--" if raw_load_cell is None else str(raw_load_cell)
+        )
         self.force_gauge.set_force_kg(data["pilot_force_kg"])
 
         trim_hold = data["trim_hold"]
@@ -881,7 +978,8 @@ class SccaDashboard(QMainWindow):
     def _on_joystick_position_changed(self, position_percent: float) -> None:
         self.position_bar.setValue(int(max(0.0, min(100.0, position_percent)) * 10))
         self.position_display.setText(f"{position_percent:.1f}%")
-
+        self._current_joystick_pos = int(position_percent * 100.0)
+    
     def _on_joystick_connection_changed(self, connected: bool) -> None:
         self.joystick_led.set_on(connected)
         if connected:
@@ -908,10 +1006,20 @@ class SccaDashboard(QMainWindow):
         length = packet_dict.get("raw_length", 0)
 
         # Direcionar comandos para o IP que está enviando telemetria
-        if isinstance(sender, str) and sender and sender != "?" and sender != self._command_target_host:
+        if (
+            isinstance(sender, str)
+            and sender
+            and sender != "?"
+            and sender != self._command_target_host
+        ):
             self._command_target_host = sender
-            self.command_sender.set_target(receiver_host=self._command_target_host, receiver_port=self._command_target_port)
-            self.logger.info(f"Destino de comandos ajustado para {self._command_target_host}:{self._command_target_port}")
+            self.command_sender.set_target(
+                receiver_host=self._command_target_host,
+                receiver_port=self._command_target_port,
+            )
+            self.logger.info(
+                f"Destino de comandos ajustado para {self._command_target_host}:{self._command_target_port}"
+            )
             self.udp_endpoints_info.setText(
                 f"Escutando telemetria em 0.0.0.0:5006 | Enviando comandos para {self._command_target_host}:{self._command_target_port}"
             )
@@ -943,7 +1051,9 @@ class SccaDashboard(QMainWindow):
         """Handler para mudanças no status de conexão UDP."""
         self.udp_status_led.set_on(connected)
         if connected:
-            self.udp_data_info.setText("Servidor UDP ativo - aguardando dados do Raspberry Pi em 5006...")
+            self.udp_data_info.setText(
+                "Servidor UDP ativo - aguardando dados do Raspberry Pi em 5006..."
+            )
         else:
             self.udp_data_info.setText("Servidor UDP desconectado")
 

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UDPPacket:
     """Estrutura base para pacotes UDP recebidos."""
+
     timestamp: float
     raw_data: bytes
     source_address: str
@@ -115,7 +116,11 @@ class UDPReceiver(QObject):
 
     def is_connected(self) -> bool:
         """Retorna o estado de conexão do socket."""
-        return self._is_connected and self.socket is not None and self.socket.state() == QAbstractSocket.SocketState.BoundState
+        return (
+            self._is_connected
+            and self.socket is not None
+            and self.socket.state() == QAbstractSocket.SocketState.BoundState
+        )
 
     def _on_ready_read(self) -> None:
         """Callback disparado quando há dados disponíveis no socket."""
@@ -197,15 +202,19 @@ class UDPReceiver(QObject):
         try:
             decoded_str = data.decode("utf-8")
             parts = [part.strip() for part in decoded_str.strip().split(",")]
-            if len(parts) == 6 and parts[0] == "C":
+            if len(parts) == 8 and parts[0] == "C":
                 result["parsed_data"] = {
                     "beep_trim_up": int(parts[1]),
                     "beep_trim_down": int(parts[2]),
                     "trim_release": int(parts[3]),
                     "override": int(parts[4]),
                     "load_cell": int(parts[5]),
+                    "pos_min": int(parts[6]),
+                    "pos_max": int(parts[7]),
                 }
-                print(f"beep_trim_up: {result["parsed_data"]["beep_trim_up"]} | beep_trim_down: {result["parsed_data"]["beep_trim_down"]} | trim_release: {result["parsed_data"]["trim_release"]} | override: {result["parsed_data"]["override"]} | load_cell: {result["parsed_data"]["load_cell"]} \n")
+                print(
+                    f"beep_trim_up: {result['parsed_data']['beep_trim_up']} | beep_trim_down: {result['parsed_data']['beep_trim_down']} | trim_release: {result['parsed_data']['trim_release']} | override: {result['parsed_data']['override']} | load_cell: {result['parsed_data']['load_cell']} | pos_min: {result['parsed_data']['pos_min']} | pos_max: {result['parsed_data']['pos_max']} \n"
+                )
                 result["parse_format"] = "csv_c"
                 return result
         except (ValueError, UnicodeDecodeError):
@@ -252,7 +261,9 @@ class MockUDPSender(QObject):
     Útil para desenvolvimento e testes sem hardware real.
     """
 
-    def __init__(self, receiver_host: str = "127.0.0.1", receiver_port: int = 5006) -> None:
+    def __init__(
+        self, receiver_host: str = "127.0.0.1", receiver_port: int = 5006
+    ) -> None:
         super().__init__()
         self.receiver_host = receiver_host
         self.receiver_port = receiver_port
@@ -291,27 +302,31 @@ class MockUDPSender(QObject):
         trim_release = 0 if trim_hold else 1
         override = 0 if pa_active else 1
         load_cell = int(round(pilot_force * 10.0))
-        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
+        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode(
+            "utf-8"
+        )
         self.socket.writeDatagram(
             data,
             QHostAddress(self.receiver_host),
             self.receiver_port,
         )
 
-        logger.debug(f"Pacote de teste #{self._packet_num} enviado: Position={position:.1f}%, Force={pilot_force:.2f}kg")
+        logger.debug(
+            f"Pacote de teste #{self._packet_num} enviado: Position={position:.1f}%, Force={pilot_force:.2f}kg"
+        )
 
 
 class CommandSender(QObject):
     """
     Envia comandos de manobra para o Raspberry Pi via UDP.
-    
+
     Permite que o dashboard envie comandos de autopiloto (manobras)
     para o Raspberry Pi executar.
     """
-    
+
     command_sent = Signal(dict)  # Sinal quando comando é enviado
     error_occurred = Signal(str)  # Sinal de erro ao enviar
-    
+
     def __init__(
         self,
         receiver_host: str = "127.0.0.1",
@@ -320,7 +335,7 @@ class CommandSender(QObject):
     ) -> None:
         """
         Inicializa o enviador de comandos.
-        
+
         Args:
             receiver_host: IP do Raspberry Pi (ou 127.0.0.1 para localhost)
             receiver_port: Porta UDP no Raspberry Pi (padrão: 5005 para comandos)
@@ -336,12 +351,16 @@ class CommandSender(QObject):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._send_periodic_control)
 
-    def set_target(self, receiver_host: str, receiver_port: Optional[int] = None) -> None:
+    def set_target(
+        self, receiver_host: str, receiver_port: Optional[int] = None
+    ) -> None:
         """Atualiza dinamicamente o destino dos comandos (IP/porta do Raspberry Pi)."""
         self.receiver_host = receiver_host
         if receiver_port is not None:
             self.receiver_port = receiver_port
-        logger.info(f"Destino de comandos atualizado para {self.receiver_host}:{self.receiver_port}")
+        logger.info(
+            f"Destino de comandos atualizado para {self.receiver_host}:{self.receiver_port}"
+        )
 
     def set_send_interval_ms(self, interval_ms: int) -> None:
         """Ajusta intervalo de envio periódico no range 50-150 ms."""
@@ -404,7 +423,9 @@ class CommandSender(QObject):
                 )
                 return True
 
-            error_msg = f"Falha ao enviar controle: enviados {sent} de {len(data)} bytes"
+            error_msg = (
+                f"Falha ao enviar controle: enviados {sent} de {len(data)} bytes"
+            )
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
             return False
@@ -413,7 +434,7 @@ class CommandSender(QObject):
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
             return False
-    
+
     def send_maneuver_command(
         self,
         maneuver_name: str,
@@ -422,11 +443,11 @@ class CommandSender(QObject):
     ) -> bool:
         """
         Envia um comando de manobra para o Raspberry Pi.
-        
+
         Args:
             maneuver_name: Nome da manobra (ex: "Circuito Classico", "8 Normais", etc)
             parameters: Dicionário opcional com parâmetros adicionais
-            
+
         Returns:
             bool: True se enviado com sucesso, False caso contrário
         """
@@ -443,7 +464,9 @@ class CommandSender(QObject):
 
     def send_maneuver_stop(self, maneuver_name: str) -> bool:
         """Envia comando para parar/cancelar uma manobra."""
-        return self.send_maneuver_command(maneuver_name=maneuver_name, parameters={}, action="stop")
+        return self.send_maneuver_command(
+            maneuver_name=maneuver_name, parameters={}, action="stop"
+        )
 
     def send_system_command(self, command: str, value: object) -> bool:
         """Envia comando de sistema (ex.: set_hydraulic_failure) para o Raspberry Pi."""
@@ -463,7 +486,9 @@ class CommandSender(QObject):
             self.error_occurred.emit(error_msg)
             return False
 
-    def send_control_command(self, position_percent: float, trim_hold: bool, beep_trim: str = "NEUTRAL") -> bool:
+    def send_control_command(
+        self, position_percent: float, trim_hold: bool, beep_trim: str = "NEUTRAL"
+    ) -> bool:
         """
         Envia um comando de controle direto para o Raspberry Pi.
 
@@ -530,7 +555,9 @@ class MockRaspberryAutopilot(QObject):
     def start(self, interval_ms: int = 50) -> bool:
         try:
             self.command_socket = QUdpSocket(self)
-            if not self.command_socket.bind(QHostAddress(self.command_host), self.command_port):
+            if not self.command_socket.bind(
+                QHostAddress(self.command_host), self.command_port
+            ):
                 msg = (
                     f"MockRaspberry bind falhou em {self.command_host}:{self.command_port} "
                     f"- {self.command_socket.errorString()}"
@@ -635,10 +662,11 @@ class MockRaspberryAutopilot(QObject):
         trim_release = 0 if self.trim_hold else 1
         override = 0 if self.pa_active else 1
         load_cell = int(round(self.pilot_force_kg * 10.0))
-        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
+        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode(
+            "utf-8"
+        )
         self.telemetry_socket.writeDatagram(
             data,
             QHostAddress(self.telemetry_host),
             self.telemetry_port,
         )
-

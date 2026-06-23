@@ -296,7 +296,9 @@ void udpThread()
             g_down.load() ? 1 : 0,
             g_trimRelease.load() ? 1 : 0,
             overrideValue,
-            g_hxNet.load()
+            g_hxNet.load(),
+            g_posMin.load(),
+            g_posMax.load()
         );
 
         sendto(
@@ -384,7 +386,7 @@ bool stepMotor(gpiod::line_request& request, bool direction)
 bool runCalibration(gpiod::line_request& request)
 {
     std::cout << "\n[CALIB] Iniciando calibragem automática..." << std::endl;
-
+  
     while (running)
     {
         bool stepped = stepMotor(request, true);
@@ -403,7 +405,7 @@ bool runCalibration(gpiod::line_request& request)
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     g_posMin = g_transducerPosition.load();
-
+    
     std::cout << "[CALIB] Fim de curso inferior atingido. posMin = "
               << g_posMin.load() << std::endl;
 
