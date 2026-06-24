@@ -391,7 +391,7 @@ bool runCalibration(gpiod::line_request& request)
 
     while (running)
     {
-        bool stepped = stepMotor(request, false);  // DOWN (direction=false desce, em direção a LIMIT_BOTTOM)
+        bool stepped = stepMotor(request, false);
 
         if (!stepped)
             break;

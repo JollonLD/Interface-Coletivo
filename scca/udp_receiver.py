@@ -194,18 +194,30 @@ class UDPReceiver(QObject):
         }
 
         # Protocolo principal: CSV iniciando com 'C'
+        # Formato enviado pelo main.cpp (Raspberry Pi):
+        # "C,up,down,trim_release,override,hx_net,pos_top,pos_bottom" (8 campos)
         try:
             decoded_str = data.decode("utf-8")
             parts = [part.strip() for part in decoded_str.strip().split(",")]
-            if len(parts) == 6 and parts[0] == "C":
+            if len(parts) == 8 and parts[0] == "C":
                 result["parsed_data"] = {
                     "beep_trim_up": int(parts[1]),
                     "beep_trim_down": int(parts[2]),
                     "trim_release": int(parts[3]),
                     "override": int(parts[4]),
                     "load_cell": int(parts[5]),
+                    "pos_top": int(parts[6]),
+                    "pos_bottom": int(parts[7]),
                 }
-                print(f"beep_trim_up: {result["parsed_data"]["beep_trim_up"]} | beep_trim_down: {result["parsed_data"]["beep_trim_down"]} | trim_release: {result["parsed_data"]["trim_release"]} | override: {result["parsed_data"]["override"]} | load_cell: {result["parsed_data"]["load_cell"]} \n")
+                logger.debug(
+                    f"beep_trim_up: {result['parsed_data']['beep_trim_up']} | "
+                    f"beep_trim_down: {result['parsed_data']['beep_trim_down']} | "
+                    f"trim_release: {result['parsed_data']['trim_release']} | "
+                    f"override: {result['parsed_data']['override']} | "
+                    f"load_cell: {result['parsed_data']['load_cell']} | "
+                    f"pos_top: {result['parsed_data']['pos_top']} | "
+                    f"pos_bottom: {result['parsed_data']['pos_bottom']}"
+                )
                 result["parse_format"] = "csv_c"
                 return result
         except (ValueError, UnicodeDecodeError):
@@ -291,7 +303,12 @@ class MockUDPSender(QObject):
         trim_release = 0 if trim_hold else 1
         override = 0 if pa_active else 1
         load_cell = int(round(pilot_force * 10.0))
-        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
+        pos_top = -32767
+        pos_bottom = 0
+        data = (
+            f"C,{beep_up},{beep_down},{trim_release},{override},"
+            f"{load_cell},{pos_top},{pos_bottom}"
+        ).encode("utf-8")
         self.socket.writeDatagram(
             data,
             QHostAddress(self.receiver_host),
@@ -463,12 +480,12 @@ class CommandSender(QObject):
             self.error_occurred.emit(error_msg)
             return False
 
-    def send_control_command(self, position_percent: float, trim_hold: bool, beep_trim: str = "NEUTRAL") -> bool:
+    def send_control_command(self, transducer_position: int, trim_hold: bool, beep_trim: str = "NEUTRAL") -> bool:
         """
         Envia um comando de controle direto para o Raspberry Pi.
 
         Args:
-            position_percent: Posição desejada (0-100%)
+            transducer_position: Posição desejada em unidades brutas do transdutor
             trim_hold: Se deve ativar o hold do trim
             beep_trim: Direção do beep ("UP", "DOWN", "NEUTRAL")
 
@@ -478,7 +495,7 @@ class CommandSender(QObject):
         del trim_hold
         del beep_trim
         self.set_control_state(
-            transducer_position=int(round(float(position_percent) * 100.0)),
+            transducer_position=int(round(float(transducer_position))),
         )
         return self._send_control_packet()
 
@@ -526,6 +543,8 @@ class MockRaspberryAutopilot(QObject):
         self._t = 0.0
         self._dt = 0.1
         self._transducer_position = int(self.position_percent * 100.0)
+        self.pos_top = -32767
+        self.pos_bottom = 0
 
     def start(self, interval_ms: int = 50) -> bool:
         try:
@@ -635,10 +654,12 @@ class MockRaspberryAutopilot(QObject):
         trim_release = 0 if self.trim_hold else 1
         override = 0 if self.pa_active else 1
         load_cell = int(round(self.pilot_force_kg * 10.0))
-        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
+        data = (
+            f"C,{beep_up},{beep_down},{trim_release},{override},"
+            f"{load_cell},{self.pos_top},{self.pos_bottom}"
+        ).encode("utf-8")
         self.telemetry_socket.writeDatagram(
             data,
             QHostAddress(self.telemetry_host),
             self.telemetry_port,
         )
-
