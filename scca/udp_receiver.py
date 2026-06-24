@@ -195,11 +195,11 @@ class UDPReceiver(QObject):
 
         # Protocolo principal: CSV iniciando com 'C'
         # Formato enviado pelo main.cpp (Raspberry Pi):
-        # "C,up,down,trim_release,override,hx_net,pos_top,pos_bottom" (8 campos)
+        # "C,up,down,trim_release,override,hx_net,pos_top,pos_bottom,calibrated" (9 campos)
         try:
             decoded_str = data.decode("utf-8")
             parts = [part.strip() for part in decoded_str.strip().split(",")]
-            if len(parts) == 8 and parts[0] == "C":
+            if len(parts) == 9 and parts[0] == "C":
                 result["parsed_data"] = {
                     "beep_trim_up": int(parts[1]),
                     "beep_trim_down": int(parts[2]),
@@ -208,6 +208,7 @@ class UDPReceiver(QObject):
                     "load_cell": int(parts[5]),
                     "pos_top": int(parts[6]),
                     "pos_bottom": int(parts[7]),
+                    "is_calibrated": int(parts[8]) != 0,
                 }
                 logger.debug(
                     f"beep_trim_up: {result['parsed_data']['beep_trim_up']} | "
@@ -216,7 +217,8 @@ class UDPReceiver(QObject):
                     f"override: {result['parsed_data']['override']} | "
                     f"load_cell: {result['parsed_data']['load_cell']} | "
                     f"pos_top: {result['parsed_data']['pos_top']} | "
-                    f"pos_bottom: {result['parsed_data']['pos_bottom']}"
+                    f"pos_bottom: {result['parsed_data']['pos_bottom']} | "
+                    f"is_calibrated: {result['parsed_data']['is_calibrated']}"
                 )
                 result["parse_format"] = "csv_c"
                 return result
@@ -304,10 +306,11 @@ class MockUDPSender(QObject):
         override = 0 if pa_active else 1
         load_cell = int(round(pilot_force * 10.0))
         pos_top = -32767
-        pos_bottom = 0
+        pos_bottom = 32767
+        calibrated = 1
         data = (
             f"C,{beep_up},{beep_down},{trim_release},{override},"
-            f"{load_cell},{pos_top},{pos_bottom}"
+            f"{load_cell},{pos_top},{pos_bottom},{calibrated}"
         ).encode("utf-8")
         self.socket.writeDatagram(
             data,
@@ -545,6 +548,7 @@ class MockRaspberryAutopilot(QObject):
         self._transducer_position = int(self.position_percent * 100.0)
         self.pos_top = -32767
         self.pos_bottom = 0
+        self.calibrated = True
 
     def start(self, interval_ms: int = 50) -> bool:
         try:
@@ -656,7 +660,7 @@ class MockRaspberryAutopilot(QObject):
         load_cell = int(round(self.pilot_force_kg * 10.0))
         data = (
             f"C,{beep_up},{beep_down},{trim_release},{override},"
-            f"{load_cell},{self.pos_top},{self.pos_bottom}"
+            f"{load_cell},{self.pos_top},{self.pos_bottom},{1 if self.calibrated else 0}"
         ).encode("utf-8")
         self.telemetry_socket.writeDatagram(
             data,

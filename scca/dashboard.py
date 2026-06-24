@@ -762,7 +762,11 @@ class SccaDashboard(QMainWindow):
         label.update()
 
     def _update_calibration_display(self) -> None:
-        """Atualiza o LED e o texto de status da calibragem automática."""
+        """Atualiza o LED e o texto de status da calibragem automática.
+        Também força a atualização imediata da barra/label de posição
+        (position_bar/position_display) usando a última leitura bruta
+        conhecida do joystick (_joystick_raw_position). 
+        """
         pos_top = self._calibration_pos_top
         pos_bottom = self._calibration_pos_bottom
 
@@ -778,6 +782,12 @@ class SccaDashboard(QMainWindow):
             self.calibration_status.setText(
                 f"Calibrado | Faixa do transdutor: [{lower_bound}, {upper_bound}]"
             )
+
+            calibrated_percent = self._raw_position_to_calibrated_percent(self._joystick_raw_position)
+            if calibrated_percent is not None:
+                smoothed_percent = self._smooth_calibrated_percent(calibrated_percent)
+                self.position_bar.setValue(int(max(0.0, min(100.0, smoothed_percent)) * 10))
+                self.position_display.setText(f"{smoothed_percent:.1f}%")
         else:
             self.calibration_led.set_on(False)
             self.calibration_status.setText(
@@ -881,7 +891,7 @@ class SccaDashboard(QMainWindow):
 
         required_keys = (
             "beep_trim_up", "beep_trim_down", "trim_release",
-            "override", "load_cell", "pos_top", "pos_bottom",
+            "override", "load_cell", "pos_top", "pos_bottom", "is_calibrated",
         )
         if all(k in parsed for k in required_keys):
             beep_up = int(parsed.get("beep_trim_up", 0))
@@ -899,6 +909,7 @@ class SccaDashboard(QMainWindow):
                 beep_trim = "NEUTRAL"
 
             pilot_force_kg = max(0.0, to_float(load_cell, 0.0) / 10.0)
+            is_calibrated = bool(parsed.get("is_calibrated", False))
             return {
                 "trim_hold": trim_release == 0,
                 "beep_trim": beep_trim,
@@ -908,7 +919,7 @@ class SccaDashboard(QMainWindow):
                 "pilot_force_kg": pilot_force_kg,
                 "pos_top": pos_top,
                 "pos_bottom": pos_bottom,
-                "is_calibrated": pos_bottom != pos_top,
+                "is_calibrated": is_calibrated,
                 "udp_connected": True,
                 "usb_connected": True,
                 "selected_maneuver": next((n for n, b in self.maneuver_buttons.items() if b.isChecked()), "Manobra 1"),
@@ -1025,6 +1036,11 @@ class SccaDashboard(QMainWindow):
         return self._filtered_calibrated_percent
 
     def _on_joystick_position_changed(self, position_percent: float) -> None:
+        # Mantido como fallback de exibição enquanto a calibragem do
+        # Raspberry Pi ainda não chegou (usa min_raw/max_raw do ambiente).
+        # Uma vez calibrado, _on_joystick_raw_position_changed assume a
+        # exibição usando a faixa [pos_top, pos_bottom] real.
+        if not self._is_calibrated:
             self.position_bar.setValue(int(max(0.0, min(100.0, position_percent)) * 10))
             self.position_display.setText(f"{position_percent:.1f}%")
 
