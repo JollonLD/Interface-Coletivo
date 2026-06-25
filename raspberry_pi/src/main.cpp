@@ -502,6 +502,8 @@ int main()
         std::cerr << "[MAIN] Calibragem falhou ou foi interrompida. Encerrando." << std::endl;
         running = false;
 
+        request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE); //destrava o motor antes de sair
+
         if (hxThread.joinable())      hxThread.join();
         if (udpComThread.joinable())  udpComThread.join();
 
