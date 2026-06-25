@@ -891,7 +891,7 @@ class SccaDashboard(QMainWindow):
 
         required_keys = (
             "beep_trim_up", "beep_trim_down", "trim_release",
-            "override", "load_cell", "pos_top", "pos_bottom", "is_calibrated",
+            "override", "load_cell", "pos_top", "pos_bottom",
         )
         if all(k in parsed for k in required_keys):
             beep_up = int(parsed.get("beep_trim_up", 0))
@@ -909,7 +909,8 @@ class SccaDashboard(QMainWindow):
                 beep_trim = "NEUTRAL"
 
             pilot_force_kg = max(0.0, to_float(load_cell, 0.0) / 10.0)
-            is_calibrated = bool(parsed.get("is_calibrated", False))
+            # is_calibrated é inferido por pos_top != pos_bottom. (pos_top e pos_bottom serão enviados com seus valores distintos somente após a calibragem completa)
+            is_calibrated = pos_top != pos_bottom
             return {
                 "trim_hold": trim_release == 0,
                 "beep_trim": beep_trim,

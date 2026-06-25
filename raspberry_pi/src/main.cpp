@@ -288,19 +288,23 @@ void udpThread()
     {
         int overrideValue = 0;
 
+        //posTop e posBottom serão enviados no pacote com seus valores reais somente após o fim da calibragem completa (após atingir os finais de curso inferior e superior)
+        bool isCalibrated = g_calibrated.load();
+        int posTopToSend = isCalibrated ? g_posTop.load() : 0;
+        int posBottomToSend = isCalibrated ? g_posBottom.load() : 0;
+
         char tx[256];
         std::snprintf(
             tx,
             sizeof(tx),
-            "C,%d,%d,%d,%d,%d,%d,%d,%d",
+            "C,%d,%d,%d,%d,%d,%d,%d",
             g_up.load() ? 1 : 0,
             g_down.load() ? 1 : 0,
             g_trimRelease.load() ? 1 : 0,
             overrideValue,
             g_hxNet.load(),
-            g_posTop.load(),
-            g_posBottom.load(),
-            g_calibrated.load() ? 1 : 0
+            posTopToSend,
+            posBottomToSend
         );
 
         sendto(
