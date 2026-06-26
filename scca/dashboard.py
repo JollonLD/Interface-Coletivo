@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import struct
 import time
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from scca.joystick_reader import create_joystick_reader
 from scca.styles import DASHBOARD_QSS
 from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot
 
@@ -155,154 +155,6 @@ class CircularForceGauge(QWidget):
             painter.drawText(int(tx) - 10, int(ty) + 5, label)
 
 
-class LinuxJoystickReader(QObject):
-    """Leitura local do joystick do Linux usado para a posição do coletivo."""
-
-    position_changed = Signal(float)
-    raw_position_changed = Signal(int)
-    connection_changed = Signal(bool)
-    error_occurred = Signal(str)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.device_path = os.getenv("SCCA_JOYSTICK_DEVICE", "/dev/input/js0")
-        axis_env = os.getenv("SCCA_JOYSTICK_AXIS", "")
-        self.axis_number = int(axis_env) if axis_env.strip().isdigit() else None
-        self.invert_axis = os.getenv("SCCA_JOYSTICK_INVERT", "0").strip().lower() in {"1", "true", "yes", "on"}
-        self.min_raw = int(os.getenv("SCCA_JOYSTICK_MIN_RAW", "32767"))
-        self.max_raw = int(os.getenv("SCCA_JOYSTICK_MAX_RAW", "-32767"))
-        self.smoothing_alpha = float(os.getenv("SCCA_JOYSTICK_SMOOTHING_ALPHA", "0.18"))
-        self.deadband_percent = float(os.getenv("SCCA_JOYSTICK_DEADBAND_PERCENT", "0.25"))
-        self.smoothing_alpha = max(0.01, min(1.0, self.smoothing_alpha))
-        self.deadband_percent = max(0.0, min(5.0, self.deadband_percent))
-        self._fd: int | None = None
-        self._connected = False
-        self._position_percent = 0.0
-        self._filtered_position_percent = 0.0
-        self._has_filtered_position = False
-        self._raw_position = 0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._poll_device)
-
-    @property
-    def position_percent(self) -> float:
-        return self._position_percent
-
-    @property
-    def raw_position(self) -> int:
-        """Último valor bruto do eixo (escala nativa do driver de joystick,
-        sem suavização nem conversão). É essa escala que deve circular no
-        protocolo UDP com o Raspberry Pi."""
-        return self._raw_position
-
-    def start(self, poll_interval_ms: int = 20) -> None:
-        self._timer.start(max(10, poll_interval_ms))
-        self._poll_device()
-
-    def stop(self) -> None:
-        self._timer.stop()
-        self._close_device()
-
-    def _set_connected(self, connected: bool) -> None:
-        if self._connected != connected:
-            self._connected = connected
-            self.connection_changed.emit(connected)
-
-    def _close_device(self) -> None:
-        if self._fd is not None:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = None
-        self._set_connected(False)
-
-    def _open_device(self) -> bool:
-        if self._fd is not None:
-            return True
-
-        try:
-            self._fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
-            self._set_connected(True)
-            return True
-        except FileNotFoundError:
-            self._set_connected(False)
-            return False
-        except PermissionError as exc:
-            self._close_device()
-            self.error_occurred.emit(f"Sem permissão para ler {self.device_path}: {exc}")
-            return False
-        except OSError as exc:
-            self._close_device()
-            self.error_occurred.emit(f"Falha ao abrir {self.device_path}: {exc}")
-            return False
-
-    def _raw_to_percent(self, raw_value: int) -> float:
-        low = self.min_raw
-        high = self.max_raw
-        if high == low:
-            return 0.0
-
-        if low > high:
-            low, high = high, low
-
-        clipped = max(low, min(high, raw_value))
-        percent = ((clipped - high) / (low - high)) * 100.0
-        if self.invert_axis:
-            percent = 100.0 - percent
-        return max(0.0, min(100.0, percent))
-
-    def _smooth_position(self, new_position: float) -> float:
-        if not self._has_filtered_position:
-            self._filtered_position_percent = new_position
-            self._has_filtered_position = True
-            return new_position
-
-        delta = new_position - self._filtered_position_percent
-        if abs(delta) <= self.deadband_percent:
-            return self._filtered_position_percent
-
-        self._filtered_position_percent += delta * self.smoothing_alpha
-        return self._filtered_position_percent
-
-    def _poll_device(self) -> None:
-        if not self._open_device() or self._fd is None:
-            return
-
-        while True:
-            try:
-                chunk = os.read(self._fd, 8)
-            except BlockingIOError:
-                break
-            except OSError as exc:
-                self.error_occurred.emit(f"Erro ao ler joystick em {self.device_path}: {exc}")
-                self._close_device()
-                return
-
-            if len(chunk) < 8:
-                break
-
-            _event_time, value, event_type, number = struct.unpack("<IhBB", chunk)
-            event_kind = event_type & 0x7F
-            if event_kind != 0x02:
-                continue
-
-            if self.axis_number is None:
-                self.axis_number = number
-
-            if number != self.axis_number:
-                continue
-
-            self._raw_position = int(value)
-            self.raw_position_changed.emit(self._raw_position)
-
-            new_position = self._raw_to_percent(value)
-            smoothed_position = self._smooth_position(new_position)
-            if abs(smoothed_position - self._position_percent) >= 0.05:
-                self._position_percent = smoothed_position
-                self.position_changed.emit(smoothed_position)
-
-
 class SccaDashboard(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -381,7 +233,7 @@ class SccaDashboard(QMainWindow):
         body.addWidget(center_container, 1)
         body.addWidget(states_panel)
 
-        self.joystick_reader = LinuxJoystickReader()
+        self.joystick_reader = create_joystick_reader()
         self.joystick_reader.position_changed.connect(self._on_joystick_position_changed)
         self.joystick_reader.raw_position_changed.connect(self._on_joystick_raw_position_changed)
         self.joystick_reader.connection_changed.connect(self._on_joystick_connection_changed)
