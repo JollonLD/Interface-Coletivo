@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from scca.styles import DASHBOARD_QSS
-from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot
+from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot, MANEUVER_IDS
 
 
 class ToggleSliderButton(QAbstractButton):
@@ -859,20 +859,18 @@ class SccaDashboard(QMainWindow):
         autopilot_active = active_maneuver is not None
         hydraulic_failure = bool(self.pane_tile.isChecked())
 
-        self._control_time_s += self._control_tick_s
         if autopilot_active and active_maneuver is not None:
             self._selected_maneuver_name = active_maneuver
-            self._transducer_cmd = self._maneuver_transducer_profile(active_maneuver, self._control_time_s)
-        else:
-            # Sem manobra ativa, retorna o comando para zero sem salto brusco.
-            self._transducer_cmd = self._joystick_raw_position
 
-        safe_target = self._clamp_to_calibration(self._transducer_cmd)
+        # Envia leitura atual do transdutor (joystick) para o Raspberry usar como feedback.
+        safe_target = self._clamp_to_calibration(self._joystick_raw_position)
+        maneuver_id = MANEUVER_IDS.get(self._selected_maneuver_name, 0) if autopilot_active else 0
 
         self.command_sender.set_control_state(
             autopilot_active=autopilot_active,
             hydraulic_failure=hydraulic_failure,
             transducer_position=safe_target,
+            maneuver_id=maneuver_id,
         )
 
     def _extract_telemetry(self, packet_dict: dict) -> dict:

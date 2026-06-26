@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -42,6 +43,21 @@ constexpr int MOTOR_ENA = 16;
 
 constexpr int STEP_DELAY_US = 7000;
 
+// Override via célula de carga (mesmos limites da interface)
+constexpr int OVERRIDE_STOPPED_LIMIT = 30000;
+constexpr int OVERRIDE_UP_LIMIT      = 180000;
+constexpr int OVERRIDE_DOWN_LIMIT    = -180000;
+
+// Margem mínima em relação aos limites calibrados do transdutor
+constexpr int CALIBRATION_MARGIN_MIN = 500;
+
+// IDs de manobra recebidos no pacote P
+constexpr int MANEUVER_NONE           = 0;
+constexpr int MANEUVER_CONSTANT_MOVE  = 1;
+constexpr int MANEUVER_SINE_SLOW      = 2;
+constexpr int MANEUVER_TRIANGLE_FAST  = 3;
+constexpr int MANEUVER_STEP_SEQUENCE  = 4;
+
 std::atomic<bool> running(true);
 
 std::atomic<bool> g_up(false);
@@ -64,13 +80,314 @@ std::atomic<bool> g_calibrated(false);
 //  2 = trim release / motor livre
 std::atomic<int> g_movement(0);
 
+std::atomic<int> g_override(0);
 std::atomic<int> g_autopilotActive(0);
 std::atomic<int> g_hydraulicFailure(0);
 std::atomic<int> g_transducerPosition(0);
+std::atomic<int> g_maneuverId(0);
+
+// Estado interno do piloto automático
+int g_paTransducerDirection = 1;
+std::chrono::steady_clock::time_point g_paStartTime;
+int g_paStepIndex = 0;
+std::chrono::steady_clock::time_point g_paStepHoldStart;
+
+bool stepMotor(gpiod::line_request& request, bool direction);
 
 void signalHandler(int)
 {
     running = false;
+}
+
+void updateOverride()
+{
+    int movement = g_movement.load();
+    int32_t hxNet = g_hxNet.load();
+    int overrideValue = 0;
+
+    if (movement == 0)
+    {
+        if (std::abs(hxNet) > OVERRIDE_STOPPED_LIMIT)
+            overrideValue = 1;
+    }
+    else if (movement == 1)
+    {
+        if (hxNet > OVERRIDE_UP_LIMIT)
+            overrideValue = 1;
+    }
+    else if (movement == -1)
+    {
+        if (hxNet < OVERRIDE_DOWN_LIMIT)
+            overrideValue = 1;
+    }
+
+    g_override = overrideValue;
+}
+
+void resetPaManeuverState()
+{
+    g_paTransducerDirection = 1;
+    g_paStepIndex = 0;
+    g_paStartTime = std::chrono::steady_clock::now();
+    g_paStepHoldStart = g_paStartTime;
+    g_up = false;
+    g_down = false;
+    g_movement = 0;
+}
+
+int calibrationMargin(int span)
+{
+    if (span <= 0)
+        return CALIBRATION_MARGIN_MIN;
+    return std::max(CALIBRATION_MARGIN_MIN, span / 20);
+}
+
+int usefulLowerBound()
+{
+    int lower = std::min(g_posTop.load(), g_posBottom.load());
+    int upper = std::max(g_posTop.load(), g_posBottom.load());
+    return lower + calibrationMargin(upper - lower);
+}
+
+int usefulUpperBound()
+{
+    int lower = std::min(g_posTop.load(), g_posBottom.load());
+    int upper = std::max(g_posTop.load(), g_posBottom.load());
+    return upper - calibrationMargin(upper - lower);
+}
+
+int usefulCenter()
+{
+    return (usefulLowerBound() + usefulUpperBound()) / 2;
+}
+
+int clampToUsefulArea(int position)
+{
+    int lower = usefulLowerBound();
+    int upper = usefulUpperBound();
+    return std::max(lower, std::min(upper, position));
+}
+
+bool positionWithinCalibration(int targetPosition)
+{
+    int lowerBound = std::min(g_posTop.load(), g_posBottom.load());
+    int upperBound = std::max(g_posTop.load(), g_posBottom.load());
+    return (targetPosition >= lowerBound) && (targetPosition <= upperBound);
+}
+
+double paElapsedSeconds()
+{
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(now - g_paStartTime).count();
+}
+
+bool stepMotorTowardTransducer(gpiod::line_request& request, bool increasePosition)
+{
+    int current = g_transducerPosition.load();
+
+    if (increasePosition)
+    {
+        if (current >= usefulUpperBound())
+            return false;
+        return stepMotor(request, true);
+    }
+
+    if (current <= usefulLowerBound())
+        return false;
+    return stepMotor(request, false);
+}
+
+void setSimulatedTrimButtons(bool movingUp, bool movingDown, bool stepped)
+{
+    g_up = stepped && movingUp;
+    g_down = stepped && movingDown;
+    if (!stepped)
+        g_movement = 0;
+    else if (movingUp)
+        g_movement = 1;
+    else if (movingDown)
+        g_movement = -1;
+    else
+        g_movement = 0;
+}
+
+bool runManeuverConstantMove(gpiod::line_request& request)
+{
+    int pos = g_transducerPosition.load();
+    int direction = g_paTransducerDirection;
+
+    if (direction > 0 && pos >= usefulUpperBound())
+        direction = -1;
+    else if (direction < 0 && pos <= usefulLowerBound())
+        direction = 1;
+
+    g_paTransducerDirection = direction;
+
+    bool stepped = false;
+    if (direction > 0)
+        stepped = stepMotorTowardTransducer(request, true);
+    else
+        stepped = stepMotorTowardTransducer(request, false);
+
+    setSimulatedTrimButtons(direction < 0, direction > 0, stepped);
+    return true;
+}
+
+bool runManeuverSineSlow(gpiod::line_request& request)
+{
+    double t = paElapsedSeconds();
+    int center = usefulCenter();
+    int halfSpan = (usefulUpperBound() - usefulLowerBound()) / 2;
+    int target = center + static_cast<int>(halfSpan * 0.85 * std::sin(0.45 * t));
+    target = clampToUsefulArea(target);
+
+    int pos = g_transducerPosition.load();
+    int deadband = std::max(300, halfSpan / 40);
+
+    if (pos < target - deadband)
+    {
+        bool stepped = stepMotorTowardTransducer(request, true);
+        setSimulatedTrimButtons(false, true, stepped);
+    }
+    else if (pos > target + deadband)
+    {
+        bool stepped = stepMotorTowardTransducer(request, false);
+        setSimulatedTrimButtons(true, false, stepped);
+    }
+    else
+    {
+        g_up = false;
+        g_down = false;
+        g_movement = 0;
+    }
+
+    return true;
+}
+
+bool runManeuverTriangleFast(gpiod::line_request& request)
+{
+    constexpr double periodSec = 5.0;
+    double t = std::fmod(paElapsedSeconds(), periodSec);
+    double phase = t / periodSec;
+
+    int lower = usefulLowerBound();
+    int upper = usefulUpperBound();
+    int target = lower;
+
+    if (phase < 0.5)
+        target = lower + static_cast<int>((upper - lower) * (phase / 0.5));
+    else
+        target = upper - static_cast<int>((upper - lower) * ((phase - 0.5) / 0.5));
+
+    target = clampToUsefulArea(target);
+    int pos = g_transducerPosition.load();
+    int deadband = std::max(250, (upper - lower) / 50);
+
+    if (pos < target - deadband)
+    {
+        bool stepped = stepMotorTowardTransducer(request, true);
+        setSimulatedTrimButtons(false, true, stepped);
+    }
+    else if (pos > target + deadband)
+    {
+        bool stepped = stepMotorTowardTransducer(request, false);
+        setSimulatedTrimButtons(true, false, stepped);
+    }
+    else
+    {
+        g_up = false;
+        g_down = false;
+        g_movement = 0;
+    }
+
+    return true;
+}
+
+bool runManeuverStepSequence(gpiod::line_request& request)
+{
+    constexpr double holdSec = 2.0;
+    int lower = usefulLowerBound();
+    int upper = usefulUpperBound();
+    int span = upper - lower;
+
+    const int levelTargets[4] = {
+        lower + span * 20 / 100,
+        lower + span * 45 / 100,
+        lower + span * 75 / 100,
+        lower + span * 30 / 100,
+    };
+
+    int target = clampToUsefulArea(levelTargets[g_paStepIndex % 4]);
+    int pos = g_transducerPosition.load();
+    int deadband = std::max(350, span / 30);
+
+    if (std::abs(pos - target) <= deadband)
+    {
+        auto now = std::chrono::steady_clock::now();
+        double held = std::chrono::duration<double>(now - g_paStepHoldStart).count();
+        if (held >= holdSec)
+        {
+            g_paStepIndex = (g_paStepIndex + 1) % 4;
+            g_paStepHoldStart = now;
+        }
+
+        g_up = false;
+        g_down = false;
+        g_movement = 0;
+        return true;
+    }
+
+    g_paStepHoldStart = std::chrono::steady_clock::now();
+
+    if (pos < target - deadband)
+    {
+        bool stepped = stepMotorTowardTransducer(request, true);
+        setSimulatedTrimButtons(false, true, stepped);
+    }
+    else
+    {
+        bool stepped = stepMotorTowardTransducer(request, false);
+        setSimulatedTrimButtons(true, false, stepped);
+    }
+
+    return true;
+}
+
+bool runAutopilotManeuver(gpiod::line_request& request, bool trimHold)
+{
+    if (!g_autopilotActive.load() || g_maneuverId.load() == MANEUVER_NONE)
+        return false;
+
+    if (!trimHold || g_override.load() || !g_calibrated.load())
+        return false;
+
+    g_trimRelease = false;
+    request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+
+    bool runningManeuver = true;
+    switch (g_maneuverId.load())
+    {
+        case MANEUVER_CONSTANT_MOVE:
+            runningManeuver = runManeuverConstantMove(request);
+            break;
+        case MANEUVER_SINE_SLOW:
+            runningManeuver = runManeuverSineSlow(request);
+            break;
+        case MANEUVER_TRIANGLE_FAST:
+            runningManeuver = runManeuverTriangleFast(request);
+            break;
+        case MANEUVER_STEP_SEQUENCE:
+            runningManeuver = runManeuverStepSequence(request);
+            break;
+        default:
+            return false;
+    }
+
+    updateOverride();
+    if (g_override.load())
+        return false;
+
+    return runningManeuver;
 }
 
 bool buttonPressed(gpiod::line_request& request, int gpio)
@@ -286,7 +603,7 @@ void udpThread()
 
     while (running)
     {
-        int overrideValue = 0;
+        int overrideValue = g_override.load();
 
         //posTop e posBottom serão enviados no pacote com seus valores reais somente após o fim da calibragem completa (após atingir os finais de curso inferior e superior)
         bool isCalibrated = g_calibrated.load();
@@ -347,12 +664,27 @@ void udpThread()
                 int ap = 0;
                 int hyd = 0;
                 int transducer = 0;
+                int maneuver = 0;
+                int previousManeuver = g_maneuverId.load();
+                bool parsed = false;
 
-                if (std::sscanf(buffer, "P,%d,%d,%d", &ap, &hyd, &transducer) == 3)
+                if (std::sscanf(buffer, "P,%d,%d,%d,%d", &ap, &hyd, &transducer, &maneuver) == 4)
+                    parsed = true;
+                else if (std::sscanf(buffer, "P,%d,%d,%d", &ap, &hyd, &transducer) == 3)
+                {
+                    maneuver = ap ? MANEUVER_CONSTANT_MOVE : MANEUVER_NONE;
+                    parsed = true;
+                }
+
+                if (parsed)
                 {
                     g_autopilotActive = ap;
                     g_hydraulicFailure = hyd;
                     g_transducerPosition = transducer;
+                    g_maneuverId = maneuver;
+
+                    if (!ap || maneuver != previousManeuver)
+                        resetPaManeuverState();
                 }
             }
         }
@@ -441,18 +773,12 @@ bool runCalibration(gpiod::line_request& request)
     }
 
     g_calibrated = true;
+    resetPaManeuverState();
 
     std::cout << "[CALIB] Calibragem concluída: posTop (LIMIT_TOP) = "
               << g_posTop.load() << ", posBottom (LIMIT_BOTTOM) = " << g_posBottom.load() << std::endl;
 
     return true;
-}
-
-bool positionWithinCalibration(int targetPosition)
-{
-    int lowerBound = std::min(g_posTop.load(), g_posBottom.load());
-    int upperBound = std::max(g_posTop.load(), g_posBottom.load());
-    return (targetPosition >= lowerBound) && (targetPosition <= upperBound);
 }
 
 int main()
@@ -516,15 +842,48 @@ int main()
         bool down = buttonPressed(request, BTN_DOWN);
         bool trimRelease = buttonPressed(request, BTN_TRIM_RELEASE);
 
-        //leitura dos fins de curso mantidas apenas para telemetria/log
         bool limitTop = buttonPressed(request, LIMIT_TOP);
         bool limitBottom = buttonPressed(request, LIMIT_BOTTOM);
+
+        g_limitTop = limitTop;
+        g_limitBottom = limitBottom;
+
+        bool trimHold = trimRelease;
+        bool paRunning = runAutopilotManeuver(request, trimHold);
+
+        if (paRunning)
+        {
+            std::cout
+                << "\rUP:" << (g_up.load() ? 1 : 0)
+                << " DOWN:" << (g_down.load() ? 1 : 0)
+                << " TRIM_RELEASE:0"
+                << " TOP:" << limitTop
+                << " BOTTOM:" << limitBottom
+                << " MOV:" << g_movement.load()
+                << " HX_RAW:" << g_hxRaw.load()
+                << " HX_NET:" << g_hxNet.load()
+                << " INVALID:" << g_hxInvalid.load()
+                << " OVR:" << g_override.load()
+                << " AP:" << g_autopilotActive.load()
+                << " MAN:" << g_maneuverId.load()
+                << " HYD:" << g_hydraulicFailure.load()
+                << " POS:" << g_transducerPosition.load()
+                << " | PA: manobra " << g_maneuverId.load()
+                << "                    "
+                << std::flush;
+            continue;
+        }
+
+        if (g_autopilotActive.load()
+            && g_maneuverId.load() != MANEUVER_NONE
+            && (!trimHold || g_override.load()))
+        {
+            resetPaManeuverState();
+        }
 
         g_up = up;
         g_down = down;
         g_trimRelease = !trimRelease;
-        g_limitTop = limitTop;
-        g_limitBottom = limitBottom;
 
         if (!trimRelease)
         {
@@ -541,7 +900,9 @@ int main()
                 << " HX_RAW:" << g_hxRaw.load()
                 << " HX_NET:" << g_hxNet.load()
                 << " INVALID:" << g_hxInvalid.load()
+                << " OVR:" << g_override.load()
                 << " AP:" << g_autopilotActive.load()
+                << " MAN:" << g_maneuverId.load()
                 << " HYD:" << g_hydraulicFailure.load()
                 << " POS:" << g_transducerPosition.load()
                 << " | TRIM RELEASE: motor livre        "
@@ -555,6 +916,7 @@ int main()
             {
                 bool stepped = stepMotor(request, false);
                 g_movement = stepped ? 1 : 0;
+                updateOverride();
 
                 std::cout
                     << "\rUP:" << up
@@ -566,7 +928,9 @@ int main()
                     << " HX_RAW:" << g_hxRaw.load()
                     << " HX_NET:" << g_hxNet.load()
                     << " INVALID:" << g_hxInvalid.load()
+                    << " OVR:" << g_override.load()
                     << " AP:" << g_autopilotActive.load()
+                    << " MAN:" << g_maneuverId.load()
                     << " HYD:" << g_hydraulicFailure.load()
                     << " POS:" << g_transducerPosition.load()
                     << (stepped ? " | UP movimentando                 "
@@ -577,6 +941,7 @@ int main()
             {
                 bool stepped = stepMotor(request, true);
                 g_movement = stepped ? -1 : 0;
+                updateOverride();
 
                 std::cout
                     << "\rUP:" << up
@@ -588,7 +953,9 @@ int main()
                     << " HX_RAW:" << g_hxRaw.load()
                     << " HX_NET:" << g_hxNet.load()
                     << " INVALID:" << g_hxInvalid.load()
+                    << " OVR:" << g_override.load()
                     << " AP:" << g_autopilotActive.load()
+                    << " MAN:" << g_maneuverId.load()
                     << " HYD:" << g_hydraulicFailure.load()
                     << " POS:" << g_transducerPosition.load()
                     << (stepped ? " | DOWN movimentando               "
@@ -598,6 +965,7 @@ int main()
             else
             {
                 g_movement = 0;
+                updateOverride();
 
                 std::cout
                     << "\rUP:" << up
@@ -609,7 +977,9 @@ int main()
                     << " HX_RAW:" << g_hxRaw.load()
                     << " HX_NET:" << g_hxNet.load()
                     << " INVALID:" << g_hxInvalid.load()
+                    << " OVR:" << g_override.load()
                     << " AP:" << g_autopilotActive.load()
+                    << " MAN:" << g_maneuverId.load()
                     << " HYD:" << g_hydraulicFailure.load()
                     << " POS:" << g_transducerPosition.load()
                     << " | Motor parado/travado             "
