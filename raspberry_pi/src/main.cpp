@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <climits>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -86,6 +87,11 @@ std::atomic<int> g_autopilotActive(0);
 std::atomic<int> g_hydraulicFailure(0);
 std::atomic<int> g_transducerPosition(0);
 std::atomic<int> g_maneuverId(0);
+std::atomic<int> g_udpCommandsReceived(0);
+
+// Faixa observada do transdutor durante a calibragem
+int g_calibTransducerMin = INT_MAX;
+int g_calibTransducerMax = INT_MIN;
 
 // Estado interno do piloto automático
 int g_paTransducerDirection = 1;
@@ -101,6 +107,77 @@ const char* resolveDashboardIp()
     if (fromEnv != nullptr && fromEnv[0] != '\0')
         return fromEnv;
     return DASHBOARD_IP_DEFAULT;
+}
+
+int readEnvInt(const char* name, int defaultValue)
+{
+    const char* fromEnv = std::getenv(name);
+    if (fromEnv == nullptr || fromEnv[0] == '\0')
+        return defaultValue;
+    return std::atoi(fromEnv);
+}
+
+void trackTransducerReading(int& minSeen, int& maxSeen)
+{
+    int position = g_transducerPosition.load();
+    if (position < minSeen)
+        minSeen = position;
+    if (position > maxSeen)
+        maxSeen = position;
+}
+
+int averageTransducerReading(int samples = 8)
+{
+    long long sum = 0;
+    for (int i = 0; i < samples; ++i)
+    {
+        sum += g_transducerPosition.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return static_cast<int>(sum / samples);
+}
+
+bool waitForDashboardLink()
+{
+    const int timeoutSec = readEnvInt("SCCA_CALIB_UDP_TIMEOUT_SEC", 60);
+    std::cout << "[CALIB] Aguardando pacotes P do dashboard (timeout "
+              << timeoutSec << "s)..." << std::endl;
+    std::cout << "[CALIB] Inicie o dashboard em "
+              << resolveDashboardIp()
+              << " ANTES de rodar o agente na Raspberry." << std::endl;
+
+    auto start = std::chrono::steady_clock::now();
+    while (running)
+    {
+        if (g_udpCommandsReceived.load() > 0)
+        {
+            std::cout << "[CALIB] Link UDP OK | pacotes P recebidos: "
+                      << g_udpCommandsReceived.load()
+                      << " | transdutor=" << g_transducerPosition.load()
+                      << std::endl;
+            return true;
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start
+        ).count();
+
+        if (elapsed >= timeoutSec)
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    std::cerr << "[CALIB] ERRO: Nenhum pacote P recebido do dashboard." << std::endl;
+    std::cerr << "  1) Dashboard rodando? (python main.py em "
+              << resolveDashboardIp() << ")" << std::endl;
+    std::cerr << "  2) Ping entre as maquinas: ping "
+              << resolveDashboardIp() << " (na Pi) e ping 10.0.0.1 (no dashboard)" << std::endl;
+    std::cerr << "  3) IP estatico na Pi: sudo bash scripts/configure-static-ip.sh eth0"
+              << std::endl;
+    std::cerr << "  4) Joystick/transdutor conectado no dashboard (/dev/input/js0)"
+              << std::endl;
+    return false;
 }
 
 void signalHandler(int)
@@ -697,6 +774,7 @@ void udpThread()
 
                 if (parsed)
                 {
+                    g_udpCommandsReceived++;
                     g_autopilotActive = ap;
                     g_hydraulicFailure = hyd;
                     g_transducerPosition = transducer;
@@ -742,11 +820,21 @@ bool stepMotor(gpiod::line_request& request, bool direction)
 
 bool runCalibration(gpiod::line_request& request)
 {
+    if (!waitForDashboardLink())
+        return false;
+
+    const int minSpan = readEnvInt("SCCA_MIN_TRANSDUCER_SPAN", 500);
+    int minSeen = INT_MAX;
+    int maxSeen = INT_MIN;
+
     std::cout << "\n[CALIB] Iniciando calibragem automática..." << std::endl;
+    std::cout << "[CALIB] O transdutor deve variar enquanto o motor atinge os fins de curso."
+              << std::endl;
 
     while (running)
     {
         bool stepped = stepMotor(request, false);
+        trackTransducerReading(minSeen, maxSeen);
 
         if (!stepped)
             break;
@@ -759,14 +847,18 @@ bool runCalibration(gpiod::line_request& request)
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    g_posBottom = g_transducerPosition.load();
-    
+    g_posBottom = averageTransducerReading();
+    trackTransducerReading(minSeen, maxSeen);
+
     std::cout << "[CALIB] Fim de curso inferior (LIMIT_BOTTOM) atingido. posBottom = "
-              << g_posBottom.load() << std::endl;
+              << g_posBottom.load()
+              << " | faixa observada [" << minSeen << ", " << maxSeen << "]"
+              << std::endl;
 
     while (running)
     {
         bool stepped = stepMotor(request, true);
+        trackTransducerReading(minSeen, maxSeen);
 
         if (!stepped)
             break;
@@ -779,15 +871,48 @@ bool runCalibration(gpiod::line_request& request)
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    g_posTop = g_transducerPosition.load();
+    g_posTop = averageTransducerReading();
+    trackTransducerReading(minSeen, maxSeen);
 
     std::cout << "[CALIB] Fim de curso superior (LIMIT_TOP) atingido. posTop = "
-              << g_posTop.load() << std::endl;
+              << g_posTop.load()
+              << " | faixa observada [" << minSeen << ", " << maxSeen << "]"
+              << std::endl;
+
+    g_calibTransducerMin = minSeen;
+    g_calibTransducerMax = maxSeen;
+
+    int observedSpan = (minSeen == INT_MAX || maxSeen == INT_MIN) ? 0 : (maxSeen - minSeen);
+    int snapshotSpan = std::abs(g_posTop.load() - g_posBottom.load());
+
+    if (observedSpan < minSpan)
+    {
+        std::cerr << "[CALIB] ERRO: Transdutor nao variou o suficiente durante a calibragem."
+                  << std::endl;
+        std::cerr << "  Faixa observada=" << observedSpan
+                  << " (minimo " << minSpan << ")." << std::endl;
+        std::cerr << "  Causas comuns:" << std::endl;
+        std::cerr << "    - Dashboard sem link UDP com a Raspberry (ping 10.0.0.1)" << std::endl;
+        std::cerr << "    - Joystick/transdutor desconectado ou parado em /dev/input/js0" << std::endl;
+        std::cerr << "    - Mecanismo do coletivo nao move o sensor do transdutor" << std::endl;
+        return false;
+    }
 
     if (g_posTop.load() == g_posBottom.load())
     {
-        std::cerr << "[CALIB] ERRO: posTop (" <<g_posTop.load() << ") == posBottom (" <<g_posBottom.load() << "). "
-                  << "Fins de curso não produziram leituras distintas." << std::endl;
+        g_posBottom = minSeen;
+        g_posTop = maxSeen;
+        snapshotSpan = std::abs(g_posTop.load() - g_posBottom.load());
+
+        std::cout << "[CALIB] Snapshots iguais; usando faixa observada: bottom="
+                  << g_posBottom.load() << " top=" << g_posTop.load() << std::endl;
+    }
+
+    if (snapshotSpan < minSpan)
+    {
+        std::cerr << "[CALIB] ERRO: posTop (" << g_posTop.load()
+                  << ") e posBottom (" << g_posBottom.load()
+                  << ") sem separacao util." << std::endl;
         return false;
     }
 
@@ -795,7 +920,8 @@ bool runCalibration(gpiod::line_request& request)
     resetPaManeuverState();
 
     std::cout << "[CALIB] Calibragem concluída: posTop (LIMIT_TOP) = "
-              << g_posTop.load() << ", posBottom (LIMIT_BOTTOM) = " << g_posBottom.load() << std::endl;
+              << g_posTop.load() << ", posBottom (LIMIT_BOTTOM) = " << g_posBottom.load()
+              << std::endl;
 
     return true;
 }

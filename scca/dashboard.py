@@ -419,6 +419,18 @@ class SccaDashboard(QMainWindow):
         self.command_sender.start_stream()
         self.control_timer.start()
 
+        self.logger.info(
+            "Dashboard UDP ativo | telemetria :5006 | comandos -> "
+            f"{self._command_target_host}:{self._command_target_port}"
+        )
+        self.logger.info(
+            "Ordem de partida: 1) este dashboard  2) agente na Raspberry (calibragem exige pacotes P)."
+        )
+        self.maneuver_hint.setText(
+            f"Enviando P -> {self._command_target_host}:{self._command_target_port} | "
+            "Inicie a Raspberry depois do dashboard"
+        )
+
     def _panel_frame(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("panel")
@@ -1057,7 +1069,10 @@ class SccaDashboard(QMainWindow):
         if connected:
             self.joystick_status.setText(f"{self.joystick_reader.device_path} ativo")
         else:
-            self.joystick_status.setText("Aguardando joystick do Arduino")
+            self.joystick_status.setText(
+                f"Joystick ausente ({self.joystick_reader.device_path}) — "
+                "calibragem falha se transdutor nao variar"
+            )
 
     def _on_joystick_error(self, error_msg: str) -> None:
         self.logger.warning(f"Joystick: {error_msg}")
@@ -1129,7 +1144,8 @@ class SccaDashboard(QMainWindow):
     def _on_command_error(self, error_msg: str) -> None:
         """Handler para erros ao enviar comandos."""
         self.logger.error(f"Command Error: {error_msg}")
-        self.maneuver_hint.setText(f"Erro ao enviar: {error_msg}")
+        self.maneuver_hint.setText(f"Erro UDP comando: {error_msg}")
+        self.udp_data_info.setText(f"Falha ao enviar comando UDP: {error_msg}")
 
     def closeEvent(self, event) -> None:
         self.joystick_reader.stop()
