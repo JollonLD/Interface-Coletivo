@@ -446,13 +446,13 @@ int main()
 
         int currentState = g_movement.load();
 
-        int limite_superior = 200000;
-        int limite_inferior = -200000;
+        int limite_superior;
+        int limite_inferior;
 
         if (currentState == 0)
         {
             limite_inferior = -200000;
-            limite_superior = 200000;
+            limite_superior = 300000;
         }
         else if (currentState == 1 || currentState == 4)
         {
@@ -463,6 +463,10 @@ int main()
         {
             limite_inferior = -100000;
             limite_superior = 300000;
+        }
+        else{
+            limite_inferior = -200000;
+            limite_superior = 50000;
         }
         bool em_estresse = (forca_atual < limite_inferior || forca_atual > limite_superior);
 
