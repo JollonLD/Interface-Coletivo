@@ -425,6 +425,7 @@ int main()
     bool overrideState = false;
     int overrideLastPos;
     int forca_atual = g_hxNet.load();
+    bool ocorreuOverride;
 
     while (running)
     {
@@ -443,6 +444,12 @@ int main()
         g_limitBottom = limitBottom;
 
         forca_atual = g_hxNet.load();
+
+        int currentState = g_movement.load();
+        if((currentState == 0 && (forca_atual < -200000 || forca_atual > 200000)) ||
+           (currentState == 1 && (forca_atual < -300000 || forca_atual > 100000)) ||
+           (currentstate == -1 && (forca_atual < -100000 || forca_atual > 300000)) ||
+           (overrideState && (forca_atual < -100000 || forca_atual > 100000)));
 
         if (!trimRelease)
         {
@@ -468,7 +475,7 @@ int main()
                 << std::flush;
         }
         // Estado de override
-        else if(forca_atual < -400000 || forca_atual > 400000) 
+        else if(currentState) 
         {
             g_movement = 3;
             if (!overrideState)
