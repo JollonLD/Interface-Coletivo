@@ -57,6 +57,9 @@ std::atomic<int> g_hxInvalid(0);
 // -1 = DOWN
 //  0 = parado/travado
 //  2 = trim release / motor livre
+//  3 = override
+//  4 = override recover up
+//  5 = override recover down
 std::atomic<int> g_movement(0);
 
 std::atomic<int> g_autopilotActive(0);
@@ -419,6 +422,10 @@ int main()
 
     request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
 
+    bool overrideState = false;
+    int overrideLastPos;
+    int forca_atual = g_hxNet.load();
+
     while (running)
     {
         bool up = buttonPressed(request, BTN_UP);
@@ -435,10 +442,14 @@ int main()
         g_limitTop = limitTop;
         g_limitBottom = limitBottom;
 
+        forca_atual = g_hxNet.load();
+
         if (!trimRelease)
         {
             request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE);
             g_movement = 2;
+
+            overrideLastPos = g_transducerPosition.load();
 
             std::cout
                 << "\rUP:" << up
@@ -456,12 +467,40 @@ int main()
                 << " | TRIM RELEASE: motor livre        "
                 << std::flush;
         }
+        // Estado de override
+        else if(forca_atual < -400000 || forca_atual > 400000) 
+        {
+            g_movement = 3;
+            if (!overrideState)
+            {
+                overrideState = true;
+                overrideLastPos = g_transducerPosition.load(); // Salva a posição do estresse
+            }
+            request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE);
+
+            std::cout
+                << "\rUP:" << up
+                << " DOWN:" << down
+                << " TRIM_RELEASE:0"
+                << " TOP:" << limitTop
+                << " BOTTOM:" << limitBottom
+                << " MOV:" << g_movement.load()
+                << " HX_RAW:" << g_hxRaw.load()
+                << " HX_NET:" << g_hxNet.load()
+                << " INVALID:" << g_hxInvalid.load()
+                << " AP:" << g_autopilotActive.load()
+                << " HYD:" << g_hydraulicFailure.load()
+                << " POS:" << g_transducerPosition.load()
+                << " | Override                        "
+                << std::flush;
+        }
         else
         {
-            request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
-
             if (up && !down)
             {
+                overrideState = false;
+                
+                request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
                 bool stepped = stepMotor(request, false);
                 g_movement = stepped ? 1 : 0;
 
@@ -484,6 +523,9 @@ int main()
             }
             else if (down && !up)
             {
+                overrideState = false;
+                
+                request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
                 bool stepped = stepMotor(request, true);
                 g_movement = stepped ? -1 : 0;
 
@@ -506,25 +548,81 @@ int main()
             }
             else
             {
-                g_movement = 0;
+                if (overrideState)
+                {
+                    if (g_movement == 3)
+                    {
+                        if (g_transducerPosition.load() < overrideLastPos) g_movement = 4;
+                        else g_movement = 5;
+                    }
+                    if (g_movement == 4)
+                    {
+                        if (g_transducerPosition.load() < overrideLastPos && !limitBottom)
+                        {
+                            request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+                            stepMotor(request, false);
+                        }
+                        else
+                        {
+                            overrideState = false;
+                            g_movement = 0;
+                        }
+                    }
+                    else if (g_movement == 5)
+                    {
+                        if (g_transducerPosition.load() > overrideLastPos && !limitTop)
+                        {
+                            request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+                            stepMotor(request, true);
+                        }
+                        else
+                        {
+                            overrideState = false;
+                            g_movement = 0;
+                        }
+                    }
 
-                std::cout
-                    << "\rUP:" << up
-                    << " DOWN:" << down
-                    << " TRIM_RELEASE:0"
-                    << " TOP:" << limitTop
-                    << " BOTTOM:" << limitBottom
-                    << " MOV:0"
-                    << " HX_RAW:" << g_hxRaw.load()
-                    << " HX_NET:" << g_hxNet.load()
-                    << " INVALID:" << g_hxInvalid.load()
-                    << " AP:" << g_autopilotActive.load()
-                    << " HYD:" << g_hydraulicFailure.load()
-                    << " POS:" << g_transducerPosition.load()
-                    << " | Motor parado/travado             "
-                    << std::flush;
+                    std::cout
+                        << "\rUP:" << up
+                        << " DOWN:" << down
+                        << " TRIM_RELEASE:0"
+                        << " TOP:" << limitTop
+                        << " BOTTOM:" << limitBottom
+                        << " MOV:0"
+                        << " HX_RAW:" << g_hxRaw.load()
+                        << " HX_NET:" << g_hxNet.load()
+                        << " INVALID:" << g_hxInvalid.load()
+                        << " AP:" << g_autopilotActive.load()
+                        << " HYD:" << g_hydraulicFailure.load()
+                        << " POS:" << g_transducerPosition.load()
+                        << (g_movement.load() == 4 ? " | Override recover UP             "
+                                            : " | Override recover DOWN           ")
+                        << std::flush;
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+                // Estado normal
+                else 
+                {   
+                    request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+                    g_movement = 0;
+                    std::cout
+                        << "\rUP:" << up
+                        << " DOWN:" << down
+                        << " TRIM_RELEASE:0"
+                        << " TOP:" << limitTop
+                        << " BOTTOM:" << limitBottom
+                        << " MOV:0"
+                        << " HX_RAW:" << g_hxRaw.load()
+                        << " HX_NET:" << g_hxNet.load()
+                        << " INVALID:" << g_hxInvalid.load()
+                        << " AP:" << g_autopilotActive.load()
+                        << " HYD:" << g_hydraulicFailure.load()
+                        << " POS:" << g_transducerPosition.load()
+                        << " | Motor parado/travado             "
+                        << std::flush;
+    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
             }
         }
     }
