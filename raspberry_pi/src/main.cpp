@@ -389,22 +389,15 @@ bool stepMotor(gpiod::line_request& request, bool direction)
     return true;
 }
 
-// ============================================================================
-// INÍCIO — PANE HIDRÁULICA (handleHydraulicFailure)
-// Acionada quando g_hydraulicFailure == 1 (pacote UDP P: ...,hyd,...).
-// a) Desce até LIMIT_BOTTOM usando stepMotor() e permanece travado no limite.
-// b) Enquanto o sinal persistir, trim release, beep trim, override e autopiloto
-//    ficam inviabilizados (tratados no loop principal abaixo).
-// ============================================================================
 bool handleHydraulicFailure(gpiod::line_request& request)
 {
     request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
 
-    bool limitBottom = (request.get_value(LIMIT_BOTTOM) == gpiod::line::value::INACTIVE);
+    bool atBottom = (request.get_value(LIMIT_TOP) == gpiod::line::value::INACTIVE);
 
-    if (!limitBottom)
+    if (!atBottom)
     {
-        bool stepped = stepMotor(request, false);
+        bool stepped = stepMotor(request, true);
         g_movement = stepped ? -1 : 0;
         return stepped;
     }
@@ -412,9 +405,6 @@ bool handleHydraulicFailure(gpiod::line_request& request)
     g_movement = 0;
     return false;
 }
-// ============================================================================
-// FIM — PANE HIDRÁULICA (handleHydraulicFailure)
-// ============================================================================
 
 bool runCalibration(gpiod::line_request& request)
 {
@@ -552,12 +542,6 @@ int main()
         g_limitTop = limitTop;
         g_limitBottom = limitBottom;
 
-        // ====================================================================
-        // INÍCIO — PANE HIDRÁULICA (loop principal)
-        // Prioridade absoluta: inviabiliza trim release, beep trim, override
-        // e autopiloto. Motor desce via handleHydraulicFailure() -> stepMotor().
-        // Mantido enquanto g_hydraulicFailure == 1.
-        // ====================================================================
         if (hydraulicFailure)
         {
             g_up = false;
@@ -583,9 +567,6 @@ int main()
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        // ====================================================================
-        // FIM — PANE HIDRÁULICA (loop principal)
-        // ====================================================================
 
         g_up = up;
         g_down = down;

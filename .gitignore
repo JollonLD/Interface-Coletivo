@@ -1,6 +1,18 @@
+# Python
 /.venv/
-/__pycache__/
+.venv-win/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs locais
+/.logs/
+*.log
+
+# Build C++ (Raspberry Pi)
+/raspberry_pi/build/
+
+# Dependências externas compiladas localmente
 /hx711/
 /lg/
-lg.zip.venv-win/
-**/__pycache__/
+lg.zip
