@@ -425,7 +425,6 @@ int main()
     bool overrideState = false;
     int overrideLastPos;
     int forca_atual = g_hxNet.load();
-    bool ocorreuOverride;
 
     while (running)
     {
@@ -446,10 +445,26 @@ int main()
         forca_atual = g_hxNet.load();
 
         int currentState = g_movement.load();
-        if((currentState == 0 && (forca_atual < -200000 || forca_atual > 200000)) ||
-           (currentState == 1 && (forca_atual < -300000 || forca_atual > 100000)) ||
-           (currentState == -1 && (forca_atual < -100000 || forca_atual > 300000)) ||
-           (overrideState && (forca_atual < -100000 || forca_atual > 100000)));
+
+        int limite_superior = 200000;
+        int limite_inferior = -200000;
+
+        if (currentState == 0)
+        {
+            limite_inferior = -200000;
+            limite_superior = 200000;
+        }
+        else if (currentState == 1 || currentState == 4)
+        {
+            limite_inferior = -300000;
+            limite_superior = 100000;
+        }
+        else if (currentState == -1 || currentState == 5)
+        {
+            limite_inferior = -100000;
+            limite_superior = 300000;
+        }
+        bool em_estresse = (forca_atual < limite_inferior || forca_atual > limite_superior);
 
         if (!trimRelease)
         {
@@ -475,7 +490,7 @@ int main()
                 << std::flush;
         }
         // Estado de override
-        else if(currentState) 
+        else if(em_estresse) 
         {
             g_movement = 3;
             if (!overrideState)
