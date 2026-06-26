@@ -448,7 +448,7 @@ int main()
         int currentState = g_movement.load();
         if((currentState == 0 && (forca_atual < -200000 || forca_atual > 200000)) ||
            (currentState == 1 && (forca_atual < -300000 || forca_atual > 100000)) ||
-           (currentstate == -1 && (forca_atual < -100000 || forca_atual > 300000)) ||
+           (currentState == -1 && (forca_atual < -100000 || forca_atual > 300000)) ||
            (overrideState && (forca_atual < -100000 || forca_atual > 100000)));
 
         if (!trimRelease)
