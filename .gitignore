@@ -2,4 +2,5 @@
 /__pycache__/
 /hx711/
 /lg/
-lg.zip
+lg.zip.venv-win/
+**/__pycache__/
