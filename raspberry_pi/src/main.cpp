@@ -10,6 +10,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -17,8 +18,8 @@
 
 #define CHIP_PATH "/dev/gpiochip0"
 
-// Rede UDP
-constexpr const char* DASHBOARD_IP = "10.0.0.5";
+// Rede UDP (override: export SCCA_DASHBOARD_IP=10.0.0.5)
+constexpr const char* DASHBOARD_IP_DEFAULT = "10.0.0.5";
 constexpr int UDP_RX_PORT = 5005;
 constexpr int UDP_TX_PORT = 5006;
 
@@ -93,6 +94,14 @@ int g_paStepIndex = 0;
 std::chrono::steady_clock::time_point g_paStepHoldStart;
 
 bool stepMotor(gpiod::line_request& request, bool direction);
+
+const char* resolveDashboardIp()
+{
+    const char* fromEnv = std::getenv("SCCA_DASHBOARD_IP");
+    if (fromEnv != nullptr && fromEnv[0] != '\0')
+        return fromEnv;
+    return DASHBOARD_IP_DEFAULT;
+}
 
 void signalHandler(int)
 {
@@ -597,7 +606,17 @@ void udpThread()
     sockaddr_in dashboardAddr{};
     dashboardAddr.sin_family = AF_INET;
     dashboardAddr.sin_port = htons(UDP_TX_PORT);
-    inet_pton(AF_INET, DASHBOARD_IP, &dashboardAddr.sin_addr);
+
+    const char* dashboardIp = resolveDashboardIp();
+    if (inet_pton(AF_INET, dashboardIp, &dashboardAddr.sin_addr) != 1)
+    {
+        std::cerr << "[UDP] IP do dashboard invalido: " << dashboardIp << std::endl;
+        close(sock);
+        return;
+    }
+
+    std::cout << "[UDP] Escutando comandos na porta " << UDP_RX_PORT
+              << " | Telemetria para " << dashboardIp << ":" << UDP_TX_PORT << std::endl;
 
     char buffer[256];
 

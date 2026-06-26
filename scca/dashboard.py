@@ -316,7 +316,7 @@ class SccaDashboard(QMainWindow):
         self.udp_receiver.connection_status_changed.connect(self._on_udp_connection_changed)
 
         # Inicializar Command Sender (envia manobras para Raspberry Pi)
-        initial_host = os.getenv("SCCA_COMMAND_HOST", "127.0.0.1")
+        initial_host = os.getenv("SCCA_COMMAND_HOST", "10.0.0.1")
         try:
             initial_port = int(os.getenv("SCCA_COMMAND_PORT", "5005"))
         except ValueError:
