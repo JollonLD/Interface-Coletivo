@@ -6,6 +6,8 @@ import math
 import os
 import struct
 import time
+import sys
+import os
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -208,8 +210,16 @@ class LinuxJoystickReader(QObject):
             self._fd = None
         self._set_connected(False)
 
-    def _open_device(self) -> bool:
-        if self._fd is not None:
+
+    def _open_device(self):
+        if sys.platform == "win32":
+            # Windows-specific opening logic or a placeholder
+            # Note: os.open() with device paths doesn't work the same way on Windows
+            print("Joystick low-level polling via os.open is not supported on Windows.")
+            return False
+        else:
+            # Unix/Linux logic
+            self._fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
             return True
 
         try:
