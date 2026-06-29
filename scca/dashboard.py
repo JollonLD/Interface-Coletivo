@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import math
@@ -7,7 +8,6 @@ import os
 import struct
 import time
 import sys
-import os
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -158,7 +158,7 @@ class CircularForceGauge(QWidget):
 
 
 class LinuxJoystickReader(QObject):
-    """Leitura local do joystick do Linux usado para a posição do coletivo."""
+    """Leitura local do joystick do Linux ou Windows usado para a posição do coletivo."""
 
     position_changed = Signal(float)
     connection_changed = Signal(bool)
@@ -166,12 +166,23 @@ class LinuxJoystickReader(QObject):
 
     def __init__(self) -> None:
         super().__init__()
-        self.device_path = os.getenv("SCCA_JOYSTICK_DEVICE", "/dev/input/js0")
-        axis_env = os.getenv("SCCA_JOYSTICK_AXIS", "")
-        self.axis_number = int(axis_env) if axis_env.strip().isdigit() else None
+        self.is_windows = sys.platform == "win32"
+
+        if self.is_windows:
+            device_env = os.getenv("SCCA_JOYSTICK_DEVICE", "0")
+            self.device_id = int(device_env) if device_env.strip().isdigit() else 0
+            self.device_path = f"Windows joystick {self.device_id}"
+            self.axis_number = 0 if os.getenv("SCCA_JOYSTICK_AXIS", "").strip() == "" else int(os.getenv("SCCA_JOYSTICK_AXIS", "0"))
+            self.min_raw = int(os.getenv("SCCA_JOYSTICK_MIN_RAW", "0"))
+            self.max_raw = int(os.getenv("SCCA_JOYSTICK_MAX_RAW", "65535"))
+        else:
+            self.device_path = os.getenv("SCCA_JOYSTICK_DEVICE", "/dev/input/js0")
+            axis_env = os.getenv("SCCA_JOYSTICK_AXIS", "")
+            self.axis_number = int(axis_env) if axis_env.strip().isdigit() else None
+            self.min_raw = int(os.getenv("SCCA_JOYSTICK_MIN_RAW", "32767"))
+            self.max_raw = int(os.getenv("SCCA_JOYSTICK_MAX_RAW", "-32767"))
+
         self.invert_axis = os.getenv("SCCA_JOYSTICK_INVERT", "0").strip().lower() in {"1", "true", "yes", "on"}
-        self.min_raw = int(os.getenv("SCCA_JOYSTICK_MIN_RAW", "32767"))
-        self.max_raw = int(os.getenv("SCCA_JOYSTICK_MAX_RAW", "-32767"))
         self.smoothing_alpha = float(os.getenv("SCCA_JOYSTICK_SMOOTHING_ALPHA", "0.18"))
         self.deadband_percent = float(os.getenv("SCCA_JOYSTICK_DEADBAND_PERCENT", "0.25"))
         self.smoothing_alpha = max(0.01, min(1.0, self.smoothing_alpha))
@@ -181,12 +192,49 @@ class LinuxJoystickReader(QObject):
         self._position_percent = 0.0
         self._filtered_position_percent = 0.0
         self._has_filtered_position = False
+        self._platform_warning_emitted = False
+        self._fallback_position_percent = max(
+            0.0,
+            min(100.0, float(os.getenv("SCCA_JOYSTICK_FALLBACK_PERCENT", "0"))),
+        )
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_device)
+
+        if self.is_windows:
+            from ctypes import wintypes
+
+            class JOYINFOEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("dwXpos", wintypes.DWORD),
+                    ("dwYpos", wintypes.DWORD),
+                    ("dwZpos", wintypes.DWORD),
+                    ("dwRpos", wintypes.DWORD),
+                    ("dwUpos", wintypes.DWORD),
+                    ("dwVpos", wintypes.DWORD),
+                    ("dwButtons", wintypes.DWORD),
+                    ("dwButtonNumber", wintypes.DWORD),
+                    ("dwPOV", wintypes.DWORD),
+                    ("dwReserved1", wintypes.DWORD),
+                    ("dwReserved2", wintypes.DWORD),
+                ]
+
+            self._JOYINFOEX = JOYINFOEX
+            self._JOY_RETURNALL = 0xFF
+            self._JOYERR_NOERROR = 0
+            self._joyGetPosEx = ctypes.windll.winmm.joyGetPosEx
+            self._joyGetPosEx.argtypes = [wintypes.UINT, ctypes.POINTER(JOYINFOEX)]
+            self._joyGetPosEx.restype = wintypes.UINT
+            self._joyid = self.device_id
 
     @property
     def position_percent(self) -> float:
         return self._position_percent
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
 
     def start(self, poll_interval_ms: int = 20) -> None:
         self._timer.start(max(10, poll_interval_ms))
@@ -212,15 +260,10 @@ class LinuxJoystickReader(QObject):
 
 
     def _open_device(self):
-        if sys.platform == "win32":
-            # Windows-specific opening logic or a placeholder
-            # Note: os.open() with device paths doesn't work the same way on Windows
-            print("Joystick low-level polling via os.open is not supported on Windows.")
-            return False
-        else:
-            # Unix/Linux logic
-            self._fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
-            return True
+        if self.is_windows:
+            connected = self._joyGetPosEx(self._joyid, ctypes.pointer(self._JOYINFOEX())) == self._JOYERR_NOERROR
+            self._set_connected(connected)
+            return connected
 
         try:
             self._fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
@@ -253,6 +296,16 @@ class LinuxJoystickReader(QObject):
             percent = 100.0 - percent
         return max(0.0, min(100.0, percent))
 
+    def _win32_axis_to_percent(self, axis_value: int) -> float:
+        if self.max_raw == self.min_raw:
+            return 0.0
+
+        clipped = max(self.min_raw, min(self.max_raw, axis_value))
+        percent = ((clipped - self.min_raw) / (self.max_raw - self.min_raw)) * 100.0
+        if self.invert_axis:
+            percent = 100.0 - percent
+        return max(0.0, min(100.0, percent))
+
     def _smooth_position(self, new_position: float) -> float:
         if not self._has_filtered_position:
             self._filtered_position_percent = new_position
@@ -267,6 +320,24 @@ class LinuxJoystickReader(QObject):
         return self._filtered_position_percent
 
     def _poll_device(self) -> None:
+        if self.is_windows:
+            joy = self._JOYINFOEX()
+            joy.dwSize = ctypes.sizeof(joy)
+            joy.dwFlags = self._JOY_RETURNALL
+            result = self._joyGetPosEx(self._joyid, ctypes.pointer(joy))
+            connected = result == self._JOYERR_NOERROR
+            self._set_connected(connected)
+            if not connected:
+                return
+
+            axis_value = getattr(joy, "dwXpos", 0)
+            position_percent = self._win32_axis_to_percent(axis_value)
+            smoothed_position = self._smooth_position(position_percent)
+            if abs(smoothed_position - self._position_percent) >= 0.05:
+                self._position_percent = smoothed_position
+                self.position_changed.emit(smoothed_position)
+            return
+
         if not self._open_device() or self._fd is None:
             return
 
@@ -446,7 +517,10 @@ class SccaDashboard(QMainWindow):
         status_label = QLabel("Entrada local")
         status_label.setObjectName("subtitle")
         self.joystick_led = LedIndicator("#16ff9a", "#3b4754")
-        self.joystick_status = QLabel("Aguardando joystick do Arduino")
+        initial_status = "Aguardando joystick do Arduino"
+        if sys.platform == "win32":
+            initial_status = "Modo Windows: joystick não disponível; usando fallback"
+        self.joystick_status = QLabel(initial_status)
         self.joystick_status.setObjectName("subtitle")
         self.joystick_status.setStyleSheet("color: #82d8ff; font-size: 10px;")
         status_row.addWidget(status_label)
@@ -757,6 +831,20 @@ class SccaDashboard(QMainWindow):
             return levels[phase]
         return int(10000 + 6000 * math.sin(0.55 * t))
 
+    def _get_manual_transducer_command(self) -> int:
+        if not hasattr(self, "joystick_reader") or self.joystick_reader is None:
+            return max(0, self._transducer_cmd)
+
+        reader = self.joystick_reader
+        if reader.connected:
+            position_percent = max(0.0, min(100.0, reader.position_percent))
+            return int(round(position_percent * 100.0))
+
+        if reader.position_percent > 0.0:
+            return int(round(max(0.0, min(100.0, reader.position_percent)) * 100.0))
+
+        return int(round(max(0.0, min(100.0, reader._fallback_position_percent)) * 100.0))
+
     def _update_control_stream_state(self) -> None:
         active_maneuver = self._get_active_maneuver_name()
         autopilot_active = active_maneuver is not None
@@ -767,8 +855,7 @@ class SccaDashboard(QMainWindow):
             self._selected_maneuver_name = active_maneuver
             self._transducer_cmd = self._maneuver_transducer_profile(active_maneuver, self._control_time_s)
         else:
-            # Sem manobra ativa, retorna o comando para zero sem salto brusco.
-            self._transducer_cmd = int(self._transducer_cmd * 0.85)
+            self._transducer_cmd = self._get_manual_transducer_command()
 
         self.command_sender.set_control_state(
             autopilot_active=autopilot_active,
@@ -897,7 +984,10 @@ class SccaDashboard(QMainWindow):
         if connected:
             self.joystick_status.setText(f"{self.joystick_reader.device_path} ativo")
         else:
-            self.joystick_status.setText("Aguardando joystick do Arduino")
+            if sys.platform == "win32":
+                self.joystick_status.setText("Modo Windows: joystick não disponível; usando fallback")
+            else:
+                self.joystick_status.setText("Aguardando joystick do Arduino")
 
     def _on_joystick_error(self, error_msg: str) -> None:
         self.logger.warning(f"Joystick: {error_msg}")

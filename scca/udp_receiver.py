@@ -388,6 +388,7 @@ class CommandSender(QObject):
     def _send_control_packet(self) -> bool:
         try:
             data = self._build_control_payload()
+            logger.info("Controle UDP enviado: %s", data.decode("utf-8"))
             sent = self.socket.writeDatagram(
                 data,
                 QHostAddress(self.receiver_host),

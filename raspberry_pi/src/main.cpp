@@ -284,7 +284,7 @@ void udpThread()
 
     while (running)
     {
-        int overrideValue = 0;
+        int overrideValue = (g_movement.load() == 3) ? 1 : 0;
 
         char tx[256];
         std::snprintf(
@@ -426,13 +426,12 @@ int main()
     int overrideLastPos;
     int forca_atual = g_hxNet.load();
 
-    while (running)
+while (running)
     {
         bool up = buttonPressed(request, BTN_UP);
         bool down = buttonPressed(request, BTN_DOWN);
         bool trimRelease = buttonPressed(request, BTN_TRIM_RELEASE);
 
-        //leitura dos fins de curso mantidas apenas para telemetria/log
         bool limitTop = buttonPressed(request, LIMIT_TOP);
         bool limitBottom = buttonPressed(request, LIMIT_BOTTOM);
 
@@ -442,32 +441,40 @@ int main()
         g_limitTop = limitTop;
         g_limitBottom = limitBottom;
 
-        forca_atual = g_hxNet.load();
+        int forca_atual = g_hxNet.load();
 
         int currentState = g_movement.load();
+        constexpr int HYSTERESIS = 300000;
 
         int limite_superior;
         int limite_inferior;
 
         if (currentState == 0)
         {
-            limite_inferior = -200000;
-            limite_superior = 300000;
+            limite_inferior = -400000;
+            limite_superior = 500000;
         }
         else if (currentState == 1 || currentState == 4)
         {
-            limite_inferior = -300000;
-            limite_superior = 100000;
+            limite_inferior = -500000;
+            limite_superior = 400000;
         }
         else if (currentState == -1 || currentState == 5)
         {
-            limite_inferior = -100000;
-            limite_superior = 300000;
+            limite_inferior = -400000;
+            limite_superior = 500000;
         }
-        else{
-            limite_inferior = -200000;
-            limite_superior = 50000;
+        else {
+            limite_inferior = -400000;
+            limite_superior = 400000;
         }
+
+        if (overrideState)
+        {
+            limite_inferior += HYSTERESIS;
+            limite_superior -= HYSTERESIS;
+        }
+
         bool em_estresse = (forca_atual < limite_inferior || forca_atual > limite_superior);
 
         if (!trimRelease)
@@ -475,7 +482,11 @@ int main()
             request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE);
             g_movement = 2;
 
-            overrideLastPos = g_transducerPosition.load();
+            int pos_transdutor = g_transducerPosition.load();
+            if (pos_transdutor >= 0 && pos_transdutor <= 10000)
+            {
+                overrideLastPos = pos_transdutor;
+            }
 
             std::cout
                 << "\rUP:" << up
@@ -493,14 +504,17 @@ int main()
                 << " | TRIM RELEASE: motor livre        "
                 << std::flush;
         }
-        // Estado de override
         else if(em_estresse) 
         {
             g_movement = 3;
             if (!overrideState)
             {
-                overrideState = true;
-                overrideLastPos = g_transducerPosition.load(); // Salva a posição do estresse
+                int pos_transdutor = g_transducerPosition.load();
+                if (pos_transdutor >= 0 && pos_transdutor <= 10000)
+                {
+                    overrideState = true;
+                    overrideLastPos = pos_transdutor; // Salva a posição estável e válida do estresse
+                }
             }
             request.set_value(MOTOR_ENA, gpiod::line::value::ACTIVE);
 
@@ -574,37 +588,59 @@ int main()
             }
             else
             {
+                request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
                 if (overrideState)
                 {
+                    int pos_atual = g_transducerPosition.load();
+
                     if (g_movement == 3)
                     {
-                        if (g_transducerPosition.load() < overrideLastPos) g_movement = 4;
-                        else g_movement = 5;
-                    }
-                    if (g_movement == 4)
-                    {
-                        if (g_transducerPosition.load() < overrideLastPos && !limitBottom)
+                        if (pos_atual >= 0 && pos_atual <= 10000)
                         {
-                            request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+                            if (pos_atual < overrideLastPos) g_movement = 5;
+                            else g_movement = 4;
+                        }
+                        else
+                        {
+                            g_movement = 4;
+                        }
+                    }
+                    else if (g_movement == 4) // Recover UP
+                    {
+                        if (pos_atual >= 0 && pos_atual <= 10000)
+                        {
+                            if (pos_atual > overrideLastPos && !limitBottom)
+                            {
+                                stepMotor(request, false);
+                            }
+                            else
+                            {
+                                overrideState = false;
+                                g_movement = 0;
+                            }
+                        }
+                        else 
+                        {
                             stepMotor(request, false);
                         }
-                        else
-                        {
-                            overrideState = false;
-                            g_movement = 0;
-                        }
                     }
-                    else if (g_movement == 5)
+                    else if (g_movement == 5) // Recover DOWN
                     {
-                        if (g_transducerPosition.load() > overrideLastPos && !limitTop)
+                        if (pos_atual >= 0 && pos_atual <= 10000)
                         {
-                            request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
-                            stepMotor(request, true);
+                            if (pos_atual < overrideLastPos && !limitTop)
+                            {
+                                stepMotor(request, true);
+                            }
+                            else
+                            {
+                                overrideState = false;
+                                g_movement = 0;
+                            }
                         }
                         else
                         {
-                            overrideState = false;
-                            g_movement = 0;
+                            stepMotor(request, true);
                         }
                     }
 
@@ -614,22 +650,21 @@ int main()
                         << " TRIM_RELEASE:0"
                         << " TOP:" << limitTop
                         << " BOTTOM:" << limitBottom
-                        << " MOV:0"
+                        << " MOV:" << g_movement.load()
                         << " HX_RAW:" << g_hxRaw.load()
                         << " HX_NET:" << g_hxNet.load()
                         << " INVALID:" << g_hxInvalid.load()
                         << " AP:" << g_autopilotActive.load()
                         << " HYD:" << g_hydraulicFailure.load()
                         << " POS:" << g_transducerPosition.load()
-                        << (g_movement.load() == 4 ? " | Override recover UP             "
-                                            : " | Override recover DOWN           ")
+                        << (g_movement.load() == 4 ? " | Override recover UP              "
+                                                   : " | Override recover DOWN            ")
                         << std::flush;
 
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10)); 
                 }
-                // Estado normal
                 else 
                 {   
-                    request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
                     g_movement = 0;
                     std::cout
                         << "\rUP:" << up
@@ -644,9 +679,9 @@ int main()
                         << " AP:" << g_autopilotActive.load()
                         << " HYD:" << g_hydraulicFailure.load()
                         << " POS:" << g_transducerPosition.load()
-                        << " | Motor parado/travado             "
+                        << " | Motor parado/travado              "
                         << std::flush;
-    
+        
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
