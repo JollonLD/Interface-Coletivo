@@ -902,6 +902,23 @@ bool stepMotor(gpiod::line_request& request, bool direction)
     return true;
 }
 
+bool handleHydraulicFailure(gpiod::line_request& request)
+{
+    request.set_value(MOTOR_ENA, gpiod::line::value::INACTIVE);
+
+    bool atBottom = (request.get_value(LIMIT_TOP) == gpiod::line::value::INACTIVE);
+
+    if (!atBottom)
+    {
+        bool stepped = stepMotor(request, true);
+        g_movement = stepped ? -1 : 0;
+        return stepped;
+    }
+
+    g_movement = 0;
+    return false;
+}
+
 bool runCalibration(gpiod::line_request& request)
 {
     if (!waitForDashboardLink())
@@ -1073,12 +1090,39 @@ int main()
 
         bool limitTop = buttonPressed(request, LIMIT_TOP);
         bool limitBottom = buttonPressed(request, LIMIT_BOTTOM);
-
+        
+        bool hydraulicFailure = g_hydraulicFailure.load() != 0;
         g_limitTop = limitTop;
         g_limitBottom = limitBottom;
 
         bool trimHold = trimRelease;
         bool paRunning = runAutopilotManeuver(request, trimHold);
+
+        if (hydraulicFailure)
+        {
+            g_up = false;
+            g_down = false;
+            g_trimRelease = false;
+
+            bool descending = handleHydraulicFailure(request);
+
+            std::cout
+                << "\rUP:0 DOWN:0 TRIM_RELEASE:0"
+                << " TOP:" << limitTop
+                << " BOTTOM:" << limitBottom
+                << " MOV:" << g_movement.load()
+                << " HX_RAW:" << g_hxRaw.load()
+                << " HX_NET:" << g_hxNet.load()
+                << " INVALID:" << g_hxInvalid.load()
+                << " AP:0 HYD:1"
+                << " POS:" << g_transducerPosition.load()
+                << (descending ? " | PANE: descendo ao limite INF  "
+                               : " | PANE: travado no limite INF  ")
+                << std::flush;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
 
         if (paRunning)
         {
