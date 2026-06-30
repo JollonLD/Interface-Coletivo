@@ -660,18 +660,17 @@ class MockRaspberryAutopilot(QObject):
 
     def _simulate_maneuver_percent(self, maneuver_id: int, t: float) -> float:
         if maneuver_id == 1:
-            if self.position_percent >= 85.0:
-                self._pa_direction = -1
-            elif self.position_percent <= 15.0:
-                self._pa_direction = 1
-            return self.position_percent + (0.45 * self._pa_direction)
+            phase = int((t // 4.0) % 6)
+            if phase % 2 == 0:
+                return min(100.0, (t % 4.0) / 4.0 * 100.0)
+            return max(0.0, 100.0 - ((t % 4.0) / 4.0 * 100.0))
         if maneuver_id == 2:
-            return 50.0 + 35.0 * math.sin(0.45 * t)
+            phase = int((t // 5.0) % 4)
+            if phase % 2 == 0:
+                return min(100.0, (t % 5.0) / 1.5 * 100.0)
+            return max(0.0, 100.0 - ((t % 5.0) / 3.5 * 100.0))
         if maneuver_id == 3:
-            phase = (t % 5.0) / 5.0
-            if phase < 0.5:
-                return 15.0 + 70.0 * (phase / 0.5)
-            return 85.0 - 70.0 * ((phase - 0.5) / 0.5)
+            return 30.0 + 15.0 * math.sin(1.2 * t)
         if maneuver_id == 4:
             levels = [20.0, 45.0, 75.0, 30.0]
             if self._pa_step_hold <= 0.0:
